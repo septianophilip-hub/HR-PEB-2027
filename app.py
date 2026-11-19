@@ -2,6 +2,7 @@ import html
 import io
 import os
 import re
+from datetime import date
 import pandas as pd
 import streamlit as st
 import altair as alt
@@ -17,6 +18,15 @@ NAMA_BULAN = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "mei": 5, "may": 5, "jun":
               "agu": 8, "aug": 8, "sep": 9, "okt": 10, "oct": 10, "nov": 11, "des": 12, "dec": 12}
 ABAIKAN = {"idr", "usd", "description", "total", "no.", "no", "month", "desc", "budget",
            "realization", "remaining", "skk migas", "internal"}
+
+BULAN_PANJANG = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus",
+                 "September", "Oktober", "November", "Desember"]
+# Ambang untuk pengingat (bisa diubah sesuai kebutuhan)
+AMBANG_LEBIH_CEPAT = 1.15    # terpakai > 115% dari jatah ideal sampai bulan acuan
+AMBANG_SANGAT_CEPAT = 1.5    # terpakai > 150% dari jatah ideal
+AMBANG_LAMBAT = 0.7          # terpakai < 70% dari jatah ideal = belum terealisasi
+AMBANG_LONJAKAN = 1.5        # satu bulan > 150% dari jatah bulanan
+HARI_TERTAHAN = 30           # pembayaran belum Paid dan tidak bergerak > 30 hari
 
 BG, TXT, GRID = "#0e1a2b", "#cfd9ea", "#1f3350"
 
@@ -262,6 +272,7 @@ def baca_detail(xls, daftar_expense):
                     baris = {"Expense": expense, "Kategori": judul, "No": no_aktif, "Bulan": label_bulan,
                              "Item": item, "No. Dokumen": teks_dok(docs), "IDR": nominal, "Kurs": kurs,
                              "USD": nilai_usd, "Periode": periode, "Status Terakhir": terakhir,
+                             "Tanggal Terakhir": (max(valid) if valid else pd.NaT),
                              "Kurs kosong": nominal > 0 and kurs <= 0}
                     for i, nama in enumerate(TAHAP):
                         baris[nama] = teks[i]
@@ -269,6 +280,7 @@ def baca_detail(xls, daftar_expense):
     df = pd.DataFrame(hasil)
     if not df.empty:
         df["Periode"] = pd.to_datetime(df["Periode"])
+        df["Tanggal Terakhir"] = pd.to_datetime(df["Tanggal Terakhir"])
     return df, sorted(tak_terpetakan)
 
 
@@ -316,6 +328,181 @@ def proses_excel(isi, nama):
     except Exception as e:
         return {"error": f"Gagal membaca file. Pastikan ada sheet bernama 'Summary RKA'. Detail: {e}",
                 "tebakan": deteksi_perusahaan(nama, xls)}
+
+
+def analisis_kategori(budget, terpakai, t, per_bulan, tahun, basis, hari_ini):
+    """Pengingat dan saran berbasis aturan hitungan (bukan AI generatif).
+    Membandingkan pemakaian dengan jatah ideal per bulan (budget / 12)."""
+    pesan = []
+
+    def tambah(level, judul, isi, saran=""):
+        pesan.append((level, judul, isi, saran))
+
+    tak_bertanggal = t[t["Periode"].isna()]
+    usd_tak = float(tak_bertanggal["USD"].sum())
+    aktif_idx = [i for i, v in enumerate(per_bulan) if v > 0]
+
+    if hari_ini.year == tahun:
+        m_ref, ket_ref = hari_ini.month, "bulan berjalan"
+    elif hari_ini.year > tahun:
+        m_ref, ket_ref = 12, "akhir tahun anggaran"
+    elif aktif_idx:
+        m_ref = max(aktif_idx) + 1
+        ket_ref = f"bulan terakhir yang ada pengeluaran (tahun anggaran {tahun} belum berjalan)"
+    else:
+        m_ref, ket_ref = None, ""
+    nama_ref = BULAN_PANJANG[m_ref - 1] if m_ref else ""
+    bulan_sisa = (12 - m_ref) if m_ref else 12
+
+    if budget <= 0:
+        if terpakai > 0:
+            tambah("merah", f"Belum ada budget {basis}",
+                   f"Sudah ada pemakaian {usd(terpakai)}, tetapi budget {basis} untuk kategori ini masih kosong atau 0.",
+                   "Isi budget di sheet Summary RKA, atau pastikan pembayaran ini memang dibebankan ke sumber budget yang lain.")
+        else:
+            tambah("info", "Budget belum diisi", f"Budget {basis} untuk kategori ini masih kosong dan belum ada pemakaian.")
+        return pesan, ket_ref, nama_ref
+
+    jatah = budget / 12
+    persen = terpakai / budget
+
+    # 1. pemakaian total terhadap budget
+    if terpakai > budget:
+        tambah("merah", "Budget sudah terlampaui",
+               f"Terpakai {usd(terpakai)} dari budget {usd(budget)} ({persen:.0%}), lewat {usd(terpakai - budget)}.",
+               "Tahan pembayaran baru, ajukan revisi atau tambahan budget, atau minta realokasi dari pos yang masih longgar. "
+               "Tinjau juga pembayaran yang belum berstatus Paid.")
+    elif persen >= 0.9:
+        tambah("merah", "Budget hampir habis",
+               f"Terpakai {usd(terpakai)} ({persen:.0%}), sisa tinggal {usd(budget - terpakai)}"
+               + (f" untuk {bulan_sisa} bulan lagi." if bulan_sisa else "."),
+               "Prioritaskan hanya pembayaran yang wajib dan siapkan usulan tambahan budget sebelum kebutuhan baru muncul.")
+    elif persen >= 0.8:
+        tambah("kuning", f"Budget sudah terpakai {persen:.0%}",
+               f"Terpakai {usd(terpakai)}, sisa {usd(budget - terpakai)}"
+               + (f" untuk {bulan_sisa} bulan lagi." if bulan_sisa else "."),
+               "Mulai batasi pengeluaran yang tidak mendesak dan pantau tiap bulan.")
+
+    # 2. jalur pemakaian dibanding jatah ideal
+    rutin, aktif_ref, per_bulan_ref = False, [], []
+    if m_ref:
+        per_bulan_ref = per_bulan[:m_ref]
+        aktif_ref = [v for v in per_bulan_ref if v > 0]
+        rutin = len(aktif_ref) >= 3 and len(aktif_ref) / m_ref >= 0.75
+        ideal = jatah * m_ref
+        terpakai_ref = sum(per_bulan_ref) + usd_tak
+        rasio = terpakai_ref / ideal if ideal > 0 else 0
+        if rasio > AMBANG_LEBIH_CEPAT and terpakai <= budget:
+            sisa_total = budget - terpakai
+            if bulan_sisa and sisa_total > 0:
+                saran = (f"Agar tidak melewati budget, rata-rata yang tersisa hanya {usd(sisa_total / bulan_sisa)} per bulan "
+                         f"(jatah semula {usd(jatah)}). Tunda atau jadwalkan ulang pembayaran yang tidak mendesak.")
+            elif bulan_sisa:
+                saran = "Budget sudah habis padahal masih ada bulan berjalan. Ajukan tambahan budget atau realokasi."
+            else:
+                saran = "Tinjau penyebab kelebihan dan catat sebagai bahan evaluasi untuk RKA berikutnya."
+            tambah("merah" if rasio > AMBANG_SANGAT_CEPAT else "kuning", "Pengeluaran lebih cepat dari jatah",
+                   f"Sampai {nama_ref} terpakai {usd(terpakai_ref)}, sedangkan jatah ideal sampai bulan itu {usd(ideal)} "
+                   f"({m_ref} bulan × {usd(jatah)}). Itu {rasio:.0%} dari jatah, kelebihan {usd(terpakai_ref - ideal)}.", saran)
+        elif rasio < AMBANG_LAMBAT:
+            tambah("kuning", "Realisasi di bawah jatah",
+                   f"Sampai {nama_ref} baru terpakai {usd(terpakai_ref)} ({rasio:.0%} dari jatah ideal {usd(ideal)}). "
+                   f"Masih ada {usd(ideal - terpakai_ref)} yang belum terealisasi.",
+                   "Cek apakah ada tagihan, kontrak, atau kegiatan yang tertunda. Jadwalkan supaya tidak menumpuk di akhir tahun. "
+                   "Kalau memang tidak akan terpakai, pertimbangkan realokasi ke pos lain.")
+        else:
+            tambah("hijau", "Pemakaian sesuai jalur",
+                   f"Sampai {nama_ref} terpakai {usd(terpakai_ref)} ({rasio:.0%} dari jatah ideal {usd(ideal)}).")
+
+    # 3. lonjakan satu bulan
+    lonjak = [(i, v) for i, v in enumerate(per_bulan) if v > AMBANG_LONJAKAN * jatah]
+    if lonjak:
+        lonjak = sorted(lonjak, key=lambda x: x[1], reverse=True)[:3]
+        daftar = "; ".join(f"{BULAN_PANJANG[i]} {usd(v)} ({v / jatah:.1f}× jatah)" for i, v in lonjak)
+        tambah("kuning", "Ada bulan dengan lonjakan pengeluaran",
+               f"Jatah bulanan {usd(jatah)}. Lonjakan: {daftar}.",
+               "Cek apakah itu pembayaran tahunan atau sekali bayar. Kalau ya, kurangi jatah bulan-bulan lain. "
+               "Kalau bukan, evaluasi penyebabnya.")
+
+    # 4. bulan rutin yang belum ada pembayaran + proyeksi
+    if m_ref and rutin:
+        kosong = [BULAN_PANJANG[i] for i, v in enumerate(per_bulan_ref) if v == 0]
+        if kosong:
+            tambah("kuning", "Ada bulan yang belum terealisasi",
+                   "Pola pengeluaran kategori ini rutin tiap bulan, tetapi belum ada pembayaran di: " + ", ".join(kosong) + ".",
+                   "Pastikan tagihan bulan tersebut sudah diproses. Kalau terlewat, segera ajukan supaya tidak menumpuk di bulan berikutnya.")
+        rata_ref = sum(aktif_ref) / len(aktif_ref)
+        bulan_kosong_depan = sum(1 for v in per_bulan[m_ref:] if v == 0)
+        proyeksi = terpakai + rata_ref * bulan_kosong_depan
+        if bulan_kosong_depan:
+            if proyeksi > budget * 1.02:
+                tambah("kuning", "Proyeksi akhir tahun melewati budget",
+                       f"Dengan rata-rata {usd(rata_ref)} per bulan, total akhir tahun diperkirakan sekitar {usd(proyeksi)}, "
+                       f"melebihi budget {usd(budget)} sebesar {usd(proyeksi - budget)}.",
+                       "Cari penghematan sejak sekarang atau siapkan usulan tambahan budget lebih awal.")
+            elif proyeksi < budget * 0.85:
+                tambah("info", "Proyeksi akhir tahun di bawah budget",
+                       f"Dengan rata-rata {usd(rata_ref)} per bulan, total akhir tahun sekitar {usd(proyeksi)}, "
+                       f"sisa sekitar {usd(budget - proyeksi)} dari budget {usd(budget)}.",
+                       "Kalau sisa ini tidak akan terpakai, pertimbangkan realokasi ke pos yang kekurangan.")
+
+    # 5. ruang budget ke depan
+    if m_ref and bulan_sisa and budget > terpakai:
+        tambah("info", "Ruang budget ke depan",
+               f"Sisa budget {usd(budget - terpakai)} untuk {bulan_sisa} bulan setelah {nama_ref}, "
+               f"rata-rata {usd((budget - terpakai) / bulan_sisa)} per bulan (jatah semula {usd(jatah)}).")
+
+    # 6. pembayaran yang belum Paid / tertahan
+    belum = t[t["Status Terakhir"] != "Paid"]
+    if len(belum):
+        tambah("info", f"{len(belum)} pembayaran belum berstatus Paid",
+               f"Nilainya {usd(belum['USD'].sum())}. Biasanya sudah masuk perhitungan terpakai, tetapi kas belum benar-benar keluar.")
+        tertahan = belum[belum["Tanggal Terakhir"].notna()].copy()
+        if not tertahan.empty:
+            tertahan["Hari"] = (pd.Timestamp(hari_ini) - tertahan["Tanggal Terakhir"]).dt.days
+            tertahan = tertahan[tertahan["Hari"] > HARI_TERTAHAN].sort_values("Hari", ascending=False)
+            if not tertahan.empty:
+                daftar = "; ".join(
+                    f"{(b['No. Dokumen'] or b['Item'] or 'Pembayaran #' + str(b['No']))} "
+                    f"(tahap {b['Status Terakhir']}, {int(b['Hari'])} hari)" for _, b in tertahan.head(3).iterrows())
+                tambah("kuning", "Ada pembayaran yang tertahan",
+                       f"Tidak ada pergerakan lebih dari {HARI_TERTAHAN} hari dan belum Paid: {daftar}.",
+                       "Follow-up ke bagian terkait (approval, AP, atau finance) supaya tidak terlambat dibayar.")
+
+    # 7. kelengkapan data
+    if len(tak_bertanggal):
+        tambah("info", "Sebagian pembayaran belum punya tanggal",
+               f"{len(tak_bertanggal)} pembayaran ({usd(usd_tak)}) belum punya bulan atau tanggal proses, jadi tidak masuk grafik per bulan.",
+               "Isi tanggal PR Submit di Excel supaya analisis per bulan lebih akurat.")
+    return pesan, ket_ref, nama_ref
+
+
+def tampilkan_analisis(pesan, ket_ref):
+    urut = {"merah": 0, "kuning": 1, "info": 2, "hijau": 3}
+    pesan = sorted(pesan, key=lambda p: urut[p[0]])
+    levels = [p[0] for p in pesan]
+    if "merah" in levels:
+        status = "🔴 Perlu perhatian segera"
+    elif "kuning" in levels:
+        status = "🟠 Perlu dipantau"
+    elif "hijau" in levels:
+        status = "🟢 Aman"
+    else:
+        status = "ℹ️ Informasi"
+    st.markdown("#### 🧠 Analisis & Saran")
+    st.markdown(f"**Status: {status}**")
+    if ket_ref:
+        st.caption(f"Acuan waktu: {ket_ref}. Dihitung dari angka di Excel (jatah ideal per bulan = budget ÷ 12).")
+    for level, judul, isi, saran in pesan:
+        teks = f"**{judul}**  \n{isi}" + (f"\n\n💡 **Saran:** {saran}" if saran else "")
+        if level == "merah":
+            st.error(teks)
+        elif level == "kuning":
+            st.warning(teks)
+        elif level == "hijau":
+            st.success(teks)
+        else:
+            st.info(teks)
 
 
 # =====================================================================
@@ -614,6 +801,7 @@ else:
     else:
         m4.metric("Tren", "-", help="Butuh minimal 2 bulan yang ada pengeluaran")
 
+    tak = t[t["Periode"].isna()].reset_index(drop=True)
     if len(aktif_k):
         bln["Label"] = bln["Pengeluaran"].apply(lambda v: f"{v:,.0f}" if v > 0 else "")
         x_bln = alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0))
@@ -634,8 +822,36 @@ else:
             strokeDash=alt.StrokeDash("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah],
                                                                  range=[[1, 0], [6, 4]]), legend=None))
         st.altair_chart(gaya(bar + angka_bar + garis, f"{nama}: pengeluaran per bulan", 340), width="stretch")
-    else:
-        st.info("Grafik bulanan akan muncul setelah pembayaran punya bulan atau tanggal proses (mis. tanggal PR Submit).")
+
+    if not tak.empty:
+        # pembayaran yang belum punya bulan/tanggal ditampilkan per pembayaran
+        def label_bayar(i, b):
+            dasar = b["Item"] or b["Kategori"] or b["No. Dokumen"] or "Pembayaran"
+            dasar = dasar if len(dasar) <= 22 else dasar[:21] + "…"
+            return (f"#{b['No']} " if b["No"] else f"{i + 1}. ") + dasar
+
+        tak["Label"] = [label_bayar(i, b) for i, b in tak.iterrows()]
+        tak["Label"] = tak["Label"] + tak.groupby("Label").cumcount().map(lambda n: "" if n == 0 else f" ({n + 1})")
+        tak["Teks"] = tak["USD"].apply(lambda v: f"{v:,.0f}")
+        urut_label = tak["Label"].tolist()
+        rata_p = float(tak["USD"].mean())
+        x_p = alt.X("Label:N", sort=urut_label, title=None, axis=alt.Axis(labelAngle=-40, labelLimit=150))
+        bar_p = alt.Chart(tak).mark_bar(color=BIRU, cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+            x=x_p,
+            y=alt.Y("USD:Q", title="USD per pembayaran", scale=alt.Scale(domain=[0, max(tak["USD"].max(), rata_p) * 1.18])),
+            tooltip=[alt.Tooltip("Label:N", title="Pembayaran"), alt.Tooltip("USD:Q", format=",.2f")])
+        teks_p = alt.Chart(tak).mark_text(dy=-8, color=TXT, fontSize=11).encode(x=x_p, y="USD:Q", text="Teks:N")
+        garis_p = alt.Chart(pd.DataFrame({"y": [rata_p]})).mark_rule(color=KUNING, strokeWidth=2).encode(y="y:Q")
+        judul_p = (f"{nama}: pengeluaran per pembayaran" if not len(aktif_k)
+                   else f"{nama}: pembayaran yang belum punya tanggal")
+        st.altair_chart(gaya(bar_p + teks_p + garis_p, judul_p, 340), width="stretch")
+        st.caption("Garis kuning = rata-rata per pembayaran. Pembayaran ini belum punya bulan atau tanggal proses, "
+                   "jadi ditampilkan per pembayaran. Isi tanggal PR Submit di Excel supaya muncul di grafik per bulan.")
+
+    # --- analisis & saran
+    pesan, ket_ref, _ = analisis_kategori(r["Budget"], r["Total Terpakai"], t, bln["Pengeluaran"].tolist(),
+                                          tahun, basis, date.today())
+    tampilkan_analisis(pesan, ket_ref)
 
     # --- rincian pembayaran (kartu siap presentasi)
     st.markdown("#### Rincian setiap pembayaran")

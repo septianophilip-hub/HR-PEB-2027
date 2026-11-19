@@ -1,9 +1,12 @@
 import html
+import io
 import os
 import re
+from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 import altair as alt
+import requests
 
 st.set_page_config(page_title="HR RKA 2027", page_icon="💰", layout="wide")
 
@@ -295,6 +298,132 @@ def deteksi_perusahaan(nama_file, xls):
     return ""
 
 
+@st.cache_data(show_spinner="Membaca Excel...")
+def proses_excel(isi, nama):
+    """Baca satu file Excel (hasilnya disimpan sementara supaya tidak dibaca ulang)."""
+    xls = None
+    try:
+        xls = pd.ExcelFile(io.BytesIO(isi))
+        tebakan = deteksi_perusahaan(nama, xls)
+        data = baca_summary(xls)
+        if data is None or data.empty:
+            return {"error": "Tabel di sheet 'Summary RKA' tidak ditemukan.", "tebakan": tebakan}
+        try:
+            trx, tak = baca_detail(xls, data["Expenses"].tolist())
+            peringatan = ""
+        except Exception as e:
+            trx, tak = pd.DataFrame(), []
+            peringatan = f"Detail pembayaran belum bisa dibaca ({e}). Dashboard memakai angka dari sheet Summary RKA."
+        return {"error": "", "data": data, "trx": trx, "tak": tak, "peringatan": peringatan, "tebakan": tebakan}
+    except Exception as e:
+        return {"error": f"Gagal membaca file. Pastikan ada sheet bernama 'Summary RKA'. Detail: {e}",
+                "tebakan": deteksi_perusahaan(nama, xls)}
+
+
+def fmt_angka(x, desimal=2):
+    """Format Indonesia: titik untuk ribuan, koma untuk desimal."""
+    s = f"{x:,.{desimal}f}"
+    return s.replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+@st.cache_data(ttl=3600, show_spinner="Mengambil kurs terbaru dari internet...")
+def ambil_kurs(hari=45):
+    """Ambil kurs USD ke IDR. Kalau gagal, error dilempar supaya tidak ikut tersimpan di cache."""
+    akhir = date.today()
+    awal = akhir - timedelta(days=hari)
+    for base in ["https://api.frankfurter.dev/v1", "https://api.frankfurter.app"]:
+        try:
+            r = requests.get(f"{base}/{awal}..{akhir}", params={"base": "USD", "symbols": "IDR"}, timeout=10)
+            r.raise_for_status()
+            rates = r.json()["rates"]
+            df = pd.DataFrame([{"Tanggal": pd.Timestamp(k), "Kurs": float(v["IDR"])} for k, v in rates.items()])
+            if len(df):
+                return {"df": df.sort_values("Tanggal").reset_index(drop=True),
+                        "sumber": "Frankfurter (data bank sentral Eropa / ECB)"}
+        except Exception:
+            continue
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        tgl = pd.to_datetime(j.get("time_last_update_utc"), errors="coerce")
+        tgl = tgl.tz_localize(None).normalize() if pd.notna(tgl) else pd.Timestamp(date.today())
+        return {"df": pd.DataFrame([{"Tanggal": tgl, "Kurs": float(j["rates"]["IDR"])}]),
+                "sumber": "ExchangeRate-API (hanya kurs terbaru)"}
+    except Exception as e:
+        raise RuntimeError(f"Tidak bisa terhubung ke layanan kurs: {e}")
+
+
+def tampilkan_kurs():
+    st.divider()
+    st.header("💱 Kurs IDR - USD")
+    st.caption("Kurs referensi dari internet. Data disegarkan tiap jam, tetapi sumbernya memperbarui satu kali per hari kerja. "
+               "Ini bukan kurs BI, kurs pajak, atau kurs bank, jadi untuk transaksi resmi tetap gunakan kurs yang ditetapkan perusahaan.")
+    if st.button("🔄 Perbarui kurs sekarang", key="btn_kurs"):
+        ambil_kurs.clear()
+    try:
+        hasil = ambil_kurs()
+    except Exception as e:
+        hasil = None
+        st.warning(f"Kurs dari internet belum bisa diambil ({e}). Kalkulator tetap bisa dipakai dengan kurs manual.")
+
+    terbaru = None
+    if hasil is not None:
+        df = hasil["df"].copy()
+        terbaru = float(df["Kurs"].iloc[-1])
+        tgl_terbaru = df["Tanggal"].iloc[-1].strftime("%d/%m/%Y")
+        sebelumnya = float(df["Kurs"].iloc[-2]) if len(df) >= 2 else None
+        tiga_puluh = df.tail(30)
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric(f"1 USD ({tgl_terbaru})", f"Rp {fmt_angka(terbaru)}",
+                  f"{terbaru - sebelumnya:+,.2f}".replace(",", "") if sebelumnya else None, delta_color="off")
+        if len(df) >= 2:
+            a2.metric("Rata-rata 30 hari kerja", f"Rp {fmt_angka(tiga_puluh['Kurs'].mean())}")
+            a3.metric("Tertinggi", f"Rp {fmt_angka(tiga_puluh['Kurs'].max())}")
+            a4.metric("Terendah", f"Rp {fmt_angka(tiga_puluh['Kurs'].min())}")
+        st.caption(f"Sumber: {hasil['sumber']}")
+
+    # ---- kalkulator
+    st.subheader("Kalkulator")
+    k1, k2 = st.columns(2)
+    with k1:
+        arah = st.radio("Konversi", ["USD → IDR", "IDR → USD"], horizontal=True, key="kurs_arah")
+        jumlah = st.number_input("Jumlah", min_value=0.0, value=1000.0 if arah == "USD → IDR" else 16_000_000.0,
+                                 step=100.0, format="%.2f", key=f"kurs_jumlah_{arah}")
+    with k2:
+        pilihan_kurs = ["Kurs terbaru (internet)", "Kurs manual"] if terbaru else ["Kurs manual"]
+        sumber_kurs = st.radio("Kurs yang dipakai", pilihan_kurs, horizontal=True, key="kurs_sumber")
+        if sumber_kurs == "Kurs manual":
+            kurs_pakai = st.number_input("Kurs IDR per 1 USD", min_value=1.0, value=float(round(terbaru)) if terbaru else 16000.0,
+                                         step=50.0, format="%.2f", key="kurs_manual")
+        else:
+            kurs_pakai = terbaru
+            st.write(f"Kurs dipakai: **Rp {fmt_angka(kurs_pakai)}** per 1 USD")
+    if arah == "USD → IDR":
+        st.success(f"USD {fmt_angka(jumlah)} = **Rp {fmt_angka(jumlah * kurs_pakai)}**")
+    else:
+        st.success(f"Rp {fmt_angka(jumlah)} = **USD {fmt_angka(jumlah / kurs_pakai)}**")
+
+    # ---- tabel & grafik
+    if hasil is not None and len(hasil["df"]) >= 2:
+        st.subheader("Riwayat kurs (hari kerja terakhir)")
+        d = hasil["df"].copy()
+        d["Perubahan"] = d["Kurs"].diff()
+        d["Persen"] = d["Kurs"].pct_change() * 100
+        garis = alt.Chart(d).mark_line(color=BIRU, point=alt.OverlayMarkDef(color=BIRU, size=40)).encode(
+            x=alt.X("Tanggal:T", title=None, axis=alt.Axis(format="%d %b")),
+            y=alt.Y("Kurs:Q", title="Rp per 1 USD", scale=alt.Scale(zero=False)),
+            tooltip=[alt.Tooltip("Tanggal:T", format="%d/%m/%Y"), alt.Tooltip("Kurs:Q", format=",.2f", title="Rp per USD")])
+        st.altair_chart(gaya(garis, "Pergerakan kurs USD → IDR", 280), width="stretch")
+        tabel = d.sort_values("Tanggal", ascending=False).copy()
+        tabel["Tanggal"] = tabel["Tanggal"].dt.strftime("%d/%m/%Y")
+        tabel["1 USD = (Rp)"] = tabel["Kurs"].apply(fmt_angka)
+        tabel["Perubahan (Rp)"] = tabel["Perubahan"].apply(lambda x: "-" if pd.isna(x) else f"{x:+,.2f}".replace(",", ""))
+        tabel["Perubahan (%)"] = tabel["Persen"].apply(lambda x: "-" if pd.isna(x) else f"{x:+.2f}%")
+        st.dataframe(tabel[["Tanggal", "1 USD = (Rp)", "Perubahan (Rp)", "Perubahan (%)"]].head(30),
+                     hide_index=True, width="stretch")
+
+
 # =====================================================================
 #  UPLOAD
 # =====================================================================
@@ -315,38 +444,62 @@ def tampilkan_kepala(pt):
                 unsafe_allow_html=True)
 
 
-file = st.file_uploader("Upload file Excel (.xlsx)", type=["xlsx"])
-if not file:
+files = st.file_uploader("Upload file Excel PEB dan PENN (boleh dua sekaligus)", type=["xlsx"],
+                         accept_multiple_files=True)
+if not files:
     tampilkan_kepala("")
-    st.info("Silakan upload file Excel dulu.")
+    st.info("Silakan upload file Excel dulu. Anda bisa upload Excel PEB dan PENN sekaligus.")
+    tampilkan_kurs()
     st.stop()
 
-try:
-    xls = pd.ExcelFile(file)
-    data = baca_summary(xls)
-except Exception as e:
+hasil_file = [proses_excel(f.getvalue(), f.name) for f in files]
+tebakan = [h["tebakan"] for h in hasil_file]
+terdeteksi = [t for t in tebakan if t]
+perlu_cek = ("" in tebakan) or len(set(terdeteksi)) < len(terdeteksi)
+
+OPSI_PT = ["(pilih)", "PEB", "PENN"]
+pilihan_file = []
+with st.expander("📁 File yang diupload", expanded=perlu_cek):
+    st.caption("Perusahaan dibaca otomatis dari nama file atau isi Excel. Ubah di sini kalau salah.")
+    for i, (f, h) in enumerate(zip(files, hasil_file)):
+        c_nama, c_pt = st.columns([3, 1])
+        c_nama.write(f"📄 {f.name}" + (" ⚠️ gagal dibaca" if h["error"] else ""))
+        pilihan_file.append(c_pt.selectbox("Perusahaan", OPSI_PT, index=OPSI_PT.index(tebakan[i]) if tebakan[i] in OPSI_PT else 0,
+                                           key=f"pt_{i}_{f.name}", label_visibility="collapsed"))
+
+penetapan, duplikat = {}, set()
+for i, pt in enumerate(pilihan_file):
+    if pt == "(pilih)":
+        continue
+    if pt in penetapan:
+        duplikat.add(pt)
+        continue
+    penetapan[pt] = i
+if duplikat:
+    st.warning("Ada lebih dari satu file untuk " + ", ".join(sorted(duplikat)) +
+               ". Hanya file pertama yang dipakai. Ubah pilihan di bagian 'File yang diupload'.")
+if not penetapan:
     tampilkan_kepala("")
-    st.error(f"Gagal membaca file. Pastikan ada sheet bernama 'Summary RKA'. Detail: {e}")
+    st.info("Nama perusahaan belum terdeteksi. Buka 'File yang diupload' lalu pilih PEB atau PENN untuk tiap file.")
+    tampilkan_kurs()
     st.stop()
 
-if data is None or data.empty:
-    tampilkan_kepala("")
-    st.error("Tabel di sheet 'Summary RKA' tidak ditemukan.")
-    st.stop()
+tersedia = [p for p in ["PEB", "PENN"] if p in penetapan]
+if len(tersedia) > 1:
+    PERUSAHAAN = st.radio("Pilih perusahaan", tersedia, horizontal=True, key="pilih_pt")
+else:
+    PERUSAHAAN = tersedia[0]
 
-pilihan_pt = st.radio("Perusahaan", ["Otomatis", "PEB", "PENN"], horizontal=True,
-                      help="Otomatis membaca nama perusahaan dari nama file atau isi Excel. Ubah manual kalau salah.")
-PERUSAHAAN = deteksi_perusahaan(getattr(file, "name", file), xls) if pilihan_pt == "Otomatis" else pilihan_pt
 tampilkan_kepala(PERUSAHAAN)
-if not PERUSAHAAN:
-    st.info("Nama perusahaan belum terdeteksi dari file. Silakan pilih PEB atau PENN di atas.")
+h = hasil_file[penetapan[PERUSAHAAN]]
+if h["error"]:
+    st.error(h["error"])
+    tampilkan_kurs()
+    st.stop()
 
-try:
-    trx, tak_terpetakan = baca_detail(xls, data["Expenses"].tolist())
-except Exception as e:
-    trx, tak_terpetakan = pd.DataFrame(), []
-    st.warning(f"Detail pembayaran belum bisa dibaca ({e}). Dashboard memakai angka dari sheet Summary RKA.")
-
+data, trx, tak_terpetakan = h["data"], h["trx"], h["tak"]
+if h["peringatan"]:
+    st.warning(h["peringatan"])
 if tak_terpetakan:
     st.warning("Tabel berikut belum cocok dengan nama di Summary RKA: " + "; ".join(tak_terpetakan))
 
@@ -511,7 +664,7 @@ def no_line(x):
 
 
 pilihan = [f"{no_line(r['Line'])} - {r['Expenses']}" for _, r in data.iterrows()]
-pilih = st.selectbox("Pilih kategori", pilihan)
+pilih = st.selectbox("Pilih kategori", pilihan, key=f"kategori_{PERUSAHAAN}")
 r = data.iloc[pilihan.index(pilih)]
 nama = r["Expenses"]
 
@@ -664,3 +817,5 @@ with st.expander("🔎 Cek konsistensi dengan sheet Summary RKA"):
     cek["Catatan"] = cek.apply(catatan, axis=1)
     cek = cek.rename(columns={"Realisasi Excel": "Realisasi di Summary (USD)", "Realisasi": "Realisasi di Dashboard (USD)"})
     st.dataframe(cek, hide_index=True, width="stretch")
+
+tampilkan_kurs()

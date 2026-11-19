@@ -2,11 +2,9 @@ import html
 import io
 import os
 import re
-from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 import altair as alt
-import requests
 
 st.set_page_config(page_title="HR RKA 2027", page_icon="💰", layout="wide")
 
@@ -320,110 +318,6 @@ def proses_excel(isi, nama):
                 "tebakan": deteksi_perusahaan(nama, xls)}
 
 
-def fmt_angka(x, desimal=2):
-    """Format Indonesia: titik untuk ribuan, koma untuk desimal."""
-    s = f"{x:,.{desimal}f}"
-    return s.replace(",", "§").replace(".", ",").replace("§", ".")
-
-
-@st.cache_data(ttl=3600, show_spinner="Mengambil kurs terbaru dari internet...")
-def ambil_kurs(hari=45):
-    """Ambil kurs USD ke IDR. Kalau gagal, error dilempar supaya tidak ikut tersimpan di cache."""
-    akhir = date.today()
-    awal = akhir - timedelta(days=hari)
-    for base in ["https://api.frankfurter.dev/v1", "https://api.frankfurter.app"]:
-        try:
-            r = requests.get(f"{base}/{awal}..{akhir}", params={"base": "USD", "symbols": "IDR"}, timeout=10)
-            r.raise_for_status()
-            rates = r.json()["rates"]
-            df = pd.DataFrame([{"Tanggal": pd.Timestamp(k), "Kurs": float(v["IDR"])} for k, v in rates.items()])
-            if len(df):
-                return {"df": df.sort_values("Tanggal").reset_index(drop=True),
-                        "sumber": "Frankfurter (data bank sentral Eropa / ECB)"}
-        except Exception:
-            continue
-    try:
-        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
-        r.raise_for_status()
-        j = r.json()
-        tgl = pd.to_datetime(j.get("time_last_update_utc"), errors="coerce")
-        tgl = tgl.tz_localize(None).normalize() if pd.notna(tgl) else pd.Timestamp(date.today())
-        return {"df": pd.DataFrame([{"Tanggal": tgl, "Kurs": float(j["rates"]["IDR"])}]),
-                "sumber": "ExchangeRate-API (hanya kurs terbaru)"}
-    except Exception as e:
-        raise RuntimeError(f"Tidak bisa terhubung ke layanan kurs: {e}")
-
-
-def tampilkan_kurs():
-    st.divider()
-    st.header("💱 Kurs IDR - USD")
-    st.caption("Kurs referensi dari internet. Data disegarkan tiap jam, tetapi sumbernya memperbarui satu kali per hari kerja. "
-               "Ini bukan kurs BI, kurs pajak, atau kurs bank, jadi untuk transaksi resmi tetap gunakan kurs yang ditetapkan perusahaan.")
-    if st.button("🔄 Perbarui kurs sekarang", key="btn_kurs"):
-        ambil_kurs.clear()
-    try:
-        hasil = ambil_kurs()
-    except Exception as e:
-        hasil = None
-        st.warning(f"Kurs dari internet belum bisa diambil ({e}). Kalkulator tetap bisa dipakai dengan kurs manual.")
-
-    terbaru = None
-    if hasil is not None:
-        df = hasil["df"].copy()
-        terbaru = float(df["Kurs"].iloc[-1])
-        tgl_terbaru = df["Tanggal"].iloc[-1].strftime("%d/%m/%Y")
-        sebelumnya = float(df["Kurs"].iloc[-2]) if len(df) >= 2 else None
-        tiga_puluh = df.tail(30)
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric(f"1 USD ({tgl_terbaru})", f"Rp {fmt_angka(terbaru)}",
-                  f"{terbaru - sebelumnya:+,.2f}".replace(",", "") if sebelumnya else None, delta_color="off")
-        if len(df) >= 2:
-            a2.metric("Rata-rata 30 hari kerja", f"Rp {fmt_angka(tiga_puluh['Kurs'].mean())}")
-            a3.metric("Tertinggi", f"Rp {fmt_angka(tiga_puluh['Kurs'].max())}")
-            a4.metric("Terendah", f"Rp {fmt_angka(tiga_puluh['Kurs'].min())}")
-        st.caption(f"Sumber: {hasil['sumber']}")
-
-    # ---- kalkulator
-    st.subheader("Kalkulator")
-    k1, k2 = st.columns(2)
-    with k1:
-        arah = st.radio("Konversi", ["USD → IDR", "IDR → USD"], horizontal=True, key="kurs_arah")
-        jumlah = st.number_input("Jumlah", min_value=0.0, value=1000.0 if arah == "USD → IDR" else 16_000_000.0,
-                                 step=100.0, format="%.2f", key=f"kurs_jumlah_{arah}")
-    with k2:
-        pilihan_kurs = ["Kurs terbaru (internet)", "Kurs manual"] if terbaru else ["Kurs manual"]
-        sumber_kurs = st.radio("Kurs yang dipakai", pilihan_kurs, horizontal=True, key="kurs_sumber")
-        if sumber_kurs == "Kurs manual":
-            kurs_pakai = st.number_input("Kurs IDR per 1 USD", min_value=1.0, value=float(round(terbaru)) if terbaru else 16000.0,
-                                         step=50.0, format="%.2f", key="kurs_manual")
-        else:
-            kurs_pakai = terbaru
-            st.write(f"Kurs dipakai: **Rp {fmt_angka(kurs_pakai)}** per 1 USD")
-    if arah == "USD → IDR":
-        st.success(f"USD {fmt_angka(jumlah)} = **Rp {fmt_angka(jumlah * kurs_pakai)}**")
-    else:
-        st.success(f"Rp {fmt_angka(jumlah)} = **USD {fmt_angka(jumlah / kurs_pakai)}**")
-
-    # ---- tabel & grafik
-    if hasil is not None and len(hasil["df"]) >= 2:
-        st.subheader("Riwayat kurs (hari kerja terakhir)")
-        d = hasil["df"].copy()
-        d["Perubahan"] = d["Kurs"].diff()
-        d["Persen"] = d["Kurs"].pct_change() * 100
-        garis = alt.Chart(d).mark_line(color=BIRU, point=alt.OverlayMarkDef(color=BIRU, size=40)).encode(
-            x=alt.X("Tanggal:T", title=None, axis=alt.Axis(format="%d %b")),
-            y=alt.Y("Kurs:Q", title="Rp per 1 USD", scale=alt.Scale(zero=False)),
-            tooltip=[alt.Tooltip("Tanggal:T", format="%d/%m/%Y"), alt.Tooltip("Kurs:Q", format=",.2f", title="Rp per USD")])
-        st.altair_chart(gaya(garis, "Pergerakan kurs USD → IDR", 280), width="stretch")
-        tabel = d.sort_values("Tanggal", ascending=False).copy()
-        tabel["Tanggal"] = tabel["Tanggal"].dt.strftime("%d/%m/%Y")
-        tabel["1 USD = (Rp)"] = tabel["Kurs"].apply(fmt_angka)
-        tabel["Perubahan (Rp)"] = tabel["Perubahan"].apply(lambda x: "-" if pd.isna(x) else f"{x:+,.2f}".replace(",", ""))
-        tabel["Perubahan (%)"] = tabel["Persen"].apply(lambda x: "-" if pd.isna(x) else f"{x:+.2f}%")
-        st.dataframe(tabel[["Tanggal", "1 USD = (Rp)", "Perubahan (Rp)", "Perubahan (%)"]].head(30),
-                     hide_index=True, width="stretch")
-
-
 # =====================================================================
 #  UPLOAD
 # =====================================================================
@@ -449,7 +343,6 @@ files = st.file_uploader("Upload file Excel PEB dan PENN (boleh dua sekaligus)",
 if not files:
     tampilkan_kepala("")
     st.info("Silakan upload file Excel dulu. Anda bisa upload Excel PEB dan PENN sekaligus.")
-    tampilkan_kurs()
     st.stop()
 
 hasil_file = [proses_excel(f.getvalue(), f.name) for f in files]
@@ -481,7 +374,6 @@ if duplikat:
 if not penetapan:
     tampilkan_kepala("")
     st.info("Nama perusahaan belum terdeteksi. Buka 'File yang diupload' lalu pilih PEB atau PENN untuk tiap file.")
-    tampilkan_kurs()
     st.stop()
 
 tersedia = [p for p in ["PEB", "PENN"] if p in penetapan]
@@ -494,7 +386,6 @@ tampilkan_kepala(PERUSAHAAN)
 h = hasil_file[penetapan[PERUSAHAAN]]
 if h["error"]:
     st.error(h["error"])
-    tampilkan_kurs()
     st.stop()
 
 data, trx, tak_terpetakan = h["data"], h["trx"], h["tak"]
@@ -620,27 +511,38 @@ with g1:
     st.altair_chart(gaya(batang + teks, f"Budget {basis}: terpakai vs sisa per kategori", 340), width="stretch")
 
 with g2:
-    bln_all = deret_bulanan(trx)
-    aktif = bln_all[bln_all["Pengeluaran"] > 0]
-    if total_budget > 0 and not aktif.empty:
-        terakhir = aktif.index.max()
-        sisa_list = [("Awal", total_budget)]
-        kum = 0.0
-        for idx in range(terakhir + 1):
-            kum += bln_all.loc[idx, "Pengeluaran"]
-            sisa_list.append((bln_all.loc[idx, "Bulan"], total_budget - kum))
-        d_sisa = pd.DataFrame(sisa_list, columns=["Label", "Sisa"])
-        urut_x = ["Awal"] + BULAN_PENDEK
-        dasar = alt.Chart(d_sisa).encode(
-            x=alt.X("Label:N", sort=urut_x, title=None, axis=alt.Axis(labelAngle=0),
-                    scale=alt.Scale(domain=urut_x)),
-            y=alt.Y("Sisa:Q", title="USD", scale=alt.Scale(domain=[0, total_budget * 1.03])),
-            tooltip=[alt.Tooltip("Label:N", title="Akhir bulan"), alt.Tooltip("Sisa:Q", title="Sisa budget", format=",.0f")])
-        area = dasar.mark_area(color=HIJAU, opacity=0.25, line={"color": HIJAU})
-        titik = dasar.mark_point(color=HIJAU, filled=True, size=70)
-        st.altair_chart(gaya(area + titik, f"Pergerakan sisa budget {basis} per bulan (semua kategori)", 340), width="stretch")
+    pb = trx.dropna(subset=["Periode"]) if not trx.empty else pd.DataFrame()
+    if not pb.empty:
+        pb = pb[pb["Periode"].dt.year == tahun].copy()
+    if not pb.empty:
+        pb["Bulan"] = pb["Periode"].dt.month.map(lambda m: BULAN_PENDEK[m - 1])
+        agg = pb.groupby(["Bulan", "Expense"], as_index=False)["USD"].sum()
+        agg = agg[agg["USD"] > 0]
+        total_bln = deret_bulanan(trx)
+        aktif = total_bln[total_bln["Pengeluaran"] > 0]
+        rata_all = float(aktif["Pengeluaran"].mean()) if len(aktif) else 0.0
+        jatah_all = total_budget / 12 if total_budget > 0 else 0.0
+        batang_bln = alt.Chart(agg).mark_bar().encode(
+            x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0),
+                    scale=alt.Scale(domain=BULAN_PENDEK)),
+            y=alt.Y("USD:Q", title="USD per bulan", stack="zero",
+                    scale=alt.Scale(domain=[0, max(total_bln["Pengeluaran"].max(), rata_all, jatah_all) * 1.1])),
+            color=alt.Color("Expense:N", scale=alt.Scale(domain=urutan, scheme="tableau10"),
+                            legend=alt.Legend(title=None, columns=4)),
+            tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Expense:N", title="Kategori"),
+                     alt.Tooltip("USD:Q", format=",.0f")])
+        lapis_all = batang_bln
+        if rata_all > 0:
+            lapis_all = lapis_all + alt.Chart(pd.DataFrame({"y": [rata_all]})).mark_rule(
+                color=KUNING, strokeWidth=2).encode(y="y:Q")
+        if jatah_all > 0:
+            lapis_all = lapis_all + alt.Chart(pd.DataFrame({"y": [jatah_all]})).mark_rule(
+                color=HIJAU, strokeWidth=2, strokeDash=[6, 4]).encode(y="y:Q")
+        st.altair_chart(gaya(lapis_all, "Pengeluaran per bulan (semua kategori)", 340), width="stretch")
+        st.caption(f"Garis kuning = rata-rata per bulan ({usd(rata_all)}). "
+                   f"Garis hijau putus-putus = jatah per bulan, budget {basis} ÷ 12 ({usd(jatah_all)}).")
     else:
-        st.info("Grafik pergerakan sisa budget akan muncul setelah ada pembayaran yang punya tanggal atau bulan di Excel.")
+        st.info("Grafik pengeluaran per bulan akan muncul setelah ada pembayaran yang punya tanggal atau bulan di Excel.")
 
 if not trx.empty:
     tanpa_bulan = int(trx["Periode"].isna().sum())
@@ -713,38 +615,25 @@ else:
         m4.metric("Tren", "-", help="Butuh minimal 2 bulan yang ada pengeluaran")
 
     if len(aktif_k):
-        k1, k2 = st.columns(2)
-        with k1:
-            bar = alt.Chart(bln).mark_bar(color=BIRU, cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
-                x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("Pengeluaran:Q", title="USD"),
-                tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Pengeluaran:Q", format=",.0f")])
-            nama_rata, nama_jatah = "Rata-rata per bulan", "Jatah per bulan (budget ÷ 12)"
-            garis_df = pd.DataFrame({"Garis": [nama_rata, nama_jatah], "Nilai": [rata, jatah]})
-            garis_df = garis_df[garis_df["Nilai"] > 0]
-            garis = alt.Chart(garis_df).mark_rule(strokeWidth=2).encode(
-                y="Nilai:Q",
-                color=alt.Color("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah], range=[KUNING, HIJAU]),
-                                legend=alt.Legend(title=None)),
-                strokeDash=alt.StrokeDash("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah],
-                                                                     range=[[1, 0], [6, 4]]), legend=None))
-            st.altair_chart(gaya(bar + garis, f"{nama}: pengeluaran per bulan", 300), width="stretch")
-        with k2:
-            bln["Kumulatif"] = bln["Pengeluaran"].cumsum()
-            sampai = bln[bln["Pengeluaran"] > 0].index.max()
-            kum_df = bln.loc[:sampai]
-            batas = max(r["Budget"], kum_df["Kumulatif"].max()) * 1.05
-            garis_kum = alt.Chart(kum_df).mark_line(color=KUNING, point=alt.OverlayMarkDef(color=KUNING, size=70)).encode(
-                x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("Kumulatif:Q", title="USD", scale=alt.Scale(domain=[0, batas])),
-                tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Kumulatif:Q", format=",.0f", title="Total terpakai")])
-            lapis = garis_kum
-            if r["Budget"] > 0:
-                batas_budget = alt.Chart(pd.DataFrame({"y": [r["Budget"]]})).mark_rule(
-                    color=MERAH, strokeDash=[6, 4], strokeWidth=2).encode(y="y:Q")
-                lapis = garis_kum + batas_budget
-            st.altair_chart(gaya(lapis, f"{nama}: progres pengeluaran (garis merah = budget {basis})", 300),
-                            width="stretch")
+        bln["Label"] = bln["Pengeluaran"].apply(lambda v: f"{v:,.0f}" if v > 0 else "")
+        x_bln = alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0))
+        puncak_y = max(bln["Pengeluaran"].max(), rata, jatah) * 1.15
+        bar = alt.Chart(bln).mark_bar(color=BIRU, cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+            x=x_bln,
+            y=alt.Y("Pengeluaran:Q", title="USD per bulan", scale=alt.Scale(domain=[0, puncak_y])),
+            tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Pengeluaran:Q", format=",.0f")])
+        angka_bar = alt.Chart(bln).mark_text(dy=-8, color=TXT, fontSize=11).encode(
+            x=x_bln, y="Pengeluaran:Q", text="Label:N")
+        nama_rata, nama_jatah = "Rata-rata per bulan", "Jatah per bulan (budget ÷ 12)"
+        garis_df = pd.DataFrame({"Garis": [nama_rata, nama_jatah], "Nilai": [rata, jatah]})
+        garis_df = garis_df[garis_df["Nilai"] > 0]
+        garis = alt.Chart(garis_df).mark_rule(strokeWidth=2).encode(
+            y="Nilai:Q",
+            color=alt.Color("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah], range=[KUNING, HIJAU]),
+                            legend=alt.Legend(title=None)),
+            strokeDash=alt.StrokeDash("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah],
+                                                                 range=[[1, 0], [6, 4]]), legend=None))
+        st.altair_chart(gaya(bar + angka_bar + garis, f"{nama}: pengeluaran per bulan", 340), width="stretch")
     else:
         st.info("Grafik bulanan akan muncul setelah pembayaran punya bulan atau tanggal proses (mis. tanggal PR Submit).")
 
@@ -817,5 +706,3 @@ with st.expander("🔎 Cek konsistensi dengan sheet Summary RKA"):
     cek["Catatan"] = cek.apply(catatan, axis=1)
     cek = cek.rename(columns={"Realisasi Excel": "Realisasi di Summary (USD)", "Realisasi": "Realisasi di Dashboard (USD)"})
     st.dataframe(cek, hide_index=True, width="stretch")
-
-tampilkan_kurs()

@@ -22,6 +22,8 @@ ABAIKAN = {"idr", "usd", "description", "total", "no.", "no", "month", "desc", "
 BULAN_PANJANG = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus",
                  "September", "Oktober", "November", "Desember"]
 # Ambang untuk pengingat (bisa diubah sesuai kebutuhan)
+VERSI_PARSER = 4            # naikkan angka ini kalau cara baca Excel berubah (membuang data lama di memori)
+
 AMBANG_LEBIH_CEPAT = 1.15    # terpakai > 115% dari jatah ideal sampai bulan acuan
 AMBANG_SANGAT_CEPAT = 1.5    # terpakai > 150% dari jatah ideal
 AMBANG_LAMBAT = 0.7          # terpakai < 70% dari jatah ideal = belum terealisasi
@@ -309,7 +311,7 @@ def deteksi_perusahaan(nama_file, xls):
 
 
 @st.cache_data(show_spinner="Membaca Excel...")
-def proses_excel(isi, nama):
+def proses_excel(isi, nama, versi=0):
     """Baca satu file Excel (hasilnya disimpan sementara supaya tidak dibaca ulang)."""
     xls = None
     try:
@@ -334,6 +336,11 @@ def analisis_kategori(budget, terpakai, t, per_bulan, tahun, basis, hari_ini):
     """Pengingat dan saran berbasis aturan hitungan (bukan AI generatif).
     Membandingkan pemakaian dengan jatah ideal per bulan (budget / 12)."""
     pesan = []
+    t = t.copy()
+    for kolom, isi_awal in [("Tanggal Terakhir", pd.NaT), ("Status Terakhir", "Belum diproses"),
+                            ("No. Dokumen", ""), ("Item", ""), ("No", "")]:
+        if kolom not in t.columns:
+            t[kolom] = isi_awal
 
     def tambah(level, judul, isi, saran=""):
         pesan.append((level, judul, isi, saran))
@@ -532,7 +539,7 @@ if not files:
     st.info("Silakan upload file Excel dulu. Anda bisa upload Excel PEB dan PENN sekaligus.")
     st.stop()
 
-hasil_file = [proses_excel(f.getvalue(), f.name) for f in files]
+hasil_file = [proses_excel(f.getvalue(), f.name, VERSI_PARSER) for f in files]
 tebakan = [h["tebakan"] for h in hasil_file]
 terdeteksi = [t for t in tebakan if t]
 perlu_cek = ("" in tebakan) or len(set(terdeteksi)) < len(terdeteksi)

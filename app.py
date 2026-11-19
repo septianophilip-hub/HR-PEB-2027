@@ -32,6 +32,20 @@ st.markdown(f"""<style>
 .fm-row b.pos{{color:{HIJAU}}}
 .fm-row b.neg{{color:{MERAH}}}
 .fm-row b.mut{{color:#8fa3bf;font-weight:400}}
+.pay-card{{background:{BG};border:1px solid {GRID};border-radius:12px;padding:12px 14px;margin-bottom:12px;color:#e8eef7}}
+.pay-head{{display:flex;justify-content:space-between;align-items:baseline;gap:8px}}
+.pay-title{{font-weight:700;color:#ffffff;font-size:.98rem}}
+.pay-badge{{font-size:.75rem;color:{KUNING};white-space:nowrap}}
+.pay-doc{{font-size:.8rem;color:#8fa3bf;margin-top:2px}}
+.pay-doc b{{color:#e8eef7}}
+.pay-amt{{font-size:.88rem;color:#b8c7dd;margin:6px 0 8px 0}}
+.pay-amt b{{color:#ffffff}}
+.chips{{display:flex;gap:5px;flex-wrap:wrap}}
+.chip{{flex:1;min-width:64px;border-radius:8px;padding:5px 6px;font-size:.7rem;text-align:center}}
+.chip small{{display:block;font-size:.68rem}}
+.chip.on{{background:#10331f;border:1px solid {HIJAU};color:#bff5d3}}
+.chip.on small{{color:#ffffff}}
+.chip.off{{background:#16233a;border:1px solid #223756;color:#6f86a6}}
 </style>""", unsafe_allow_html=True)
 
 
@@ -47,7 +61,7 @@ def gaya(chart, judul=None, tinggi=320):
     """Beri tampilan gelap ala Football Manager pada grafik."""
     if judul:
         chart = chart.properties(title=judul)
-    return (chart.properties(height=tinggi, padding=12)
+    return (chart.properties(height=tinggi, padding={"left": 12, "top": 12, "right": 12, "bottom": 12})
             .configure(background=BG)
             .configure_axis(labelColor=TXT, titleColor=TXT, gridColor=GRID, domainColor=GRID, tickColor=GRID)
             .configure_legend(labelColor=TXT, titleColor=TXT, orient="bottom")
@@ -254,7 +268,8 @@ def baca_detail(xls, daftar_expense):
 # =====================================================================
 #  UPLOAD
 # =====================================================================
-st.title("💰 HR PEB 2027 - RKA Budget Tracker")
+st.title("👋 Halo, Philip")
+st.subheader("HR PEB 2027 · RKA Budget Tracker")
 st.caption("Upload file Excel monitoring Anda. Data hanya dibaca sementara dan tidak disimpan di server.")
 
 file = st.file_uploader("Upload file Excel (.xlsx)", type=["xlsx"])
@@ -297,31 +312,7 @@ else:
 if data["Budget"].sum() == 0:
     st.warning(f"Budget {basis} di sheet Summary masih 0 semua, jadi persentase tidak bisa dihitung.")
 
-if "simulasi" not in st.session_state:
-    st.session_state.simulasi = []
-
-with st.sidebar:
-    st.header("➕ Simulasi Pembayaran")
-    st.caption("Coba kurangi budget sebelum Anda input ke Excel.")
-    pos = st.selectbox("Pos expenses", data["Expenses"].tolist())
-    nominal = st.number_input("Nominal (IDR)", min_value=0, step=1_000_000, format="%d")
-    kurs_sim = st.number_input("Kurs IDR/USD", min_value=1, value=16000, step=100, format="%d")
-    ket = st.text_input("Keterangan (opsional)")
-    if st.button("Kurangi budget", width="stretch"):
-        if nominal > 0:
-            st.session_state.simulasi.append(
-                {"Expenses": pos, "Keterangan": ket, "IDR": nominal, "Kurs": kurs_sim, "USD": nominal / kurs_sim})
-    if st.session_state.simulasi and st.button("Hapus semua simulasi", width="stretch"):
-        st.session_state.simulasi = []
-        st.rerun()
-
-sim = pd.DataFrame(st.session_state.simulasi)
-if not sim.empty:
-    data["Simulasi"] = data["Expenses"].map(sim.groupby("Expenses")["USD"].sum()).fillna(0.0)
-else:
-    data["Simulasi"] = 0.0
-
-data["Total Terpakai"] = data["Realisasi"] + data["Simulasi"]
+data["Total Terpakai"] = data["Realisasi"]
 data["Sisa"] = data["Budget"] - data["Total Terpakai"]
 data["Persen"] = (data["Total Terpakai"] / data["Budget"]).where(data["Budget"] > 0, 0.0)
 # Realisasi dibebankan ke basis yang dipilih; budget lainnya ditampilkan utuh
@@ -348,10 +339,6 @@ c2.metric("Terpakai", usd(total_pakai))
 c3.metric("Sisa", usd(total_sisa))
 c4.metric("Utilisasi", f"{persen_total:.1%}")
 st.progress(min(max(persen_total, 0.0), 1.0))
-
-if not sim.empty:
-    st.info(f"Kartu dan grafik batang sudah termasuk simulasi sebesar {usd(data['Simulasi'].sum())}. "
-            "Grafik bulanan dan tabel detail hanya memuat data dari Excel.")
 
 st.divider()
 
@@ -461,96 +448,151 @@ st.divider()
 #  BAGIAN BAWAH: DETAIL PER KATEGORI
 # =====================================================================
 st.header("📋 Detail per Kategori")
-tabs = st.tabs(urutan)
 
-for tab, (_, r) in zip(tabs, data.iterrows()):
-    nama = r["Expenses"]
-    with tab:
-        def fmt_sisa(budget, sisa):
-            return "belum ada budget" if (budget <= 0 and sisa == 0) else usd(sisa)
 
-        st.markdown(f"#### Sisa budget {nama}")
-        st.markdown(f"**SKK:** {fmt_sisa(r['Budget SKK (USD)'], r['Sisa SKK'])} &nbsp;•&nbsp; "
-                    f"**Internal:** {fmt_sisa(r['Budget Internal (USD)'], r['Sisa Internal'])}")
+def no_line(x):
+    try:
+        return str(int(float(x)))
+    except (TypeError, ValueError):
+        return str(x)
 
-        t = trx[trx["Expense"] == nama].copy() if not trx.empty else pd.DataFrame()
-        if t.empty:
-            st.info("Belum ada pembayaran yang terisi untuk kategori ini di Excel.")
-            continue
 
-        bln = deret_bulanan(t)
-        aktif_k = bln[bln["Pengeluaran"] > 0]
-        rata = aktif_k["Pengeluaran"].mean() if len(aktif_k) else 0.0
-        jatah = r["Budget"] / 12 if r["Budget"] > 0 else 0.0
+pilihan = [f"{no_line(r['Line'])} - {r['Expenses']}" for _, r in data.iterrows()]
+pilih = st.selectbox("Pilih kategori", pilihan)
+r = data.iloc[pilihan.index(pilih)]
+nama = r["Expenses"]
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric(f"Total ({len(t)} pembayaran)", usd(t["USD"].sum()))
-        m2.metric("Rata-rata per bulan", usd(rata) if len(aktif_k) else "-")
-        if len(aktif_k):
-            puncak = aktif_k.loc[aktif_k["Pengeluaran"].idxmax()]
-            m3.metric("Bulan tertinggi", f"{puncak['Bulan']} ({usd(puncak['Pengeluaran'])})")
-        else:
-            m3.metric("Bulan tertinggi", "-")
-        if len(aktif_k) >= 2:
-            selisih = aktif_k["Pengeluaran"].iloc[-1] - aktif_k["Pengeluaran"].iloc[-2]
-            arah = "naik" if selisih > 0 else ("turun" if selisih < 0 else "stabil")
-            m4.metric(f"Tren ({aktif_k['Bulan'].iloc[-1]} vs {aktif_k['Bulan'].iloc[-2]})",
-                      arah.capitalize(), f"{selisih:+,.0f} USD", delta_color="inverse")
-        else:
-            m4.metric("Tren", "-", help="Butuh minimal 2 bulan yang ada pengeluaran")
+t = trx[trx["Expense"] == nama].copy() if not trx.empty else pd.DataFrame()
+sudah_paid = t.loc[t["Paid"] != "", "USD"].sum() if not t.empty else 0.0
 
-        if len(aktif_k):
-            k1, k2 = st.columns(2)
-            with k1:
-                bar = alt.Chart(bln).mark_bar(color=BIRU, cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
-                    x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y("Pengeluaran:Q", title="USD"),
-                    tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Pengeluaran:Q", format=",.0f")])
-                nama_rata, nama_jatah = "Rata-rata per bulan", "Jatah per bulan (budget ÷ 12)"
-                garis_df = pd.DataFrame({"Garis": [nama_rata, nama_jatah], "Nilai": [rata, jatah]})
-                garis_df = garis_df[garis_df["Nilai"] > 0]
-                garis = alt.Chart(garis_df).mark_rule(strokeWidth=2).encode(
-                    y="Nilai:Q",
-                    color=alt.Color("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah], range=[KUNING, HIJAU]),
-                                    legend=alt.Legend(title=None)),
-                    strokeDash=alt.StrokeDash("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah],
-                                                                         range=[[1, 0], [6, 4]]), legend=None))
-                st.altair_chart(gaya(bar + garis, f"{nama}: pengeluaran per bulan", 300), width="stretch")
-            with k2:
-                bln["Kumulatif"] = bln["Pengeluaran"].cumsum()
-                sampai = bln[bln["Pengeluaran"] > 0].index.max()
-                kum_df = bln.loc[:sampai]
-                batas = max(r["Budget"], kum_df["Kumulatif"].max()) * 1.05
-                garis_kum = alt.Chart(kum_df).mark_line(color=KUNING, point=alt.OverlayMarkDef(color=KUNING, size=70)).encode(
-                    x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y("Kumulatif:Q", title="USD", scale=alt.Scale(domain=[0, batas])),
-                    tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Kumulatif:Q", format=",.0f", title="Total terpakai")])
-                lapis = garis_kum
-                if r["Budget"] > 0:
-                    batas_budget = alt.Chart(pd.DataFrame({"y": [r["Budget"]]})).mark_rule(
-                        color=MERAH, strokeDash=[6, 4], strokeWidth=2).encode(y="y:Q")
-                    lapis = garis_kum + batas_budget
-                st.altair_chart(gaya(lapis, f"{nama}: progres pengeluaran (garis merah = budget {basis})", 300),
-                                width="stretch")
-        else:
-            st.info("Grafik bulanan akan muncul setelah pembayaran punya bulan atau tanggal proses (mis. tanggal PR Submit).")
 
-        # --- tabel detail
-        st.markdown("##### Rincian pembayaran")
+def nilai_budget(x):
+    return usd(x) if x > 0 else "Belum diisi"
+
+
+st.markdown(f"### {pilih}")
+d1, d2, d3, d4, d5 = st.columns(5)
+d1.metric("Budget SKK", nilai_budget(r["Budget SKK (USD)"]))
+d2.metric("Budget Internal", nilai_budget(r["Budget Internal (USD)"]))
+d3.metric("Sudah keluar", usd(r["Total Terpakai"]))
+d4.metric("Sisa SKK", usd(r["Sisa SKK"]))
+d5.metric("Sisa Internal", usd(r["Sisa Internal"]) if (r["Budget Internal (USD)"] > 0 or r["Sisa Internal"] != 0) else "Belum diisi")
+if r["Budget"] > 0:
+    st.progress(min(max(r["Persen"], 0.0), 1.0))
+    st.caption(f"{r['Persen']:.1%} dari budget {basis} sudah terpakai. "
+               f"Dari total yang keluar, {usd(sudah_paid)} sudah berstatus Paid.")
+
+if t.empty:
+    st.info("Belum ada pembayaran yang terisi untuk kategori ini di Excel.")
+else:
+    bln = deret_bulanan(t)
+    aktif_k = bln[bln["Pengeluaran"] > 0]
+    rata = aktif_k["Pengeluaran"].mean() if len(aktif_k) else 0.0
+    jatah = r["Budget"] / 12 if r["Budget"] > 0 else 0.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(f"Total ({len(t)} pembayaran)", usd(t["USD"].sum()))
+    m2.metric("Rata-rata per bulan", usd(rata) if len(aktif_k) else "-")
+    if len(aktif_k):
+        puncak = aktif_k.loc[aktif_k["Pengeluaran"].idxmax()]
+        m3.metric("Bulan tertinggi", f"{puncak['Bulan']} ({usd(puncak['Pengeluaran'])})")
+    else:
+        m3.metric("Bulan tertinggi", "-")
+    if len(aktif_k) >= 2:
+        selisih = aktif_k["Pengeluaran"].iloc[-1] - aktif_k["Pengeluaran"].iloc[-2]
+        arah = "naik" if selisih > 0 else ("turun" if selisih < 0 else "stabil")
+        m4.metric(f"Tren ({aktif_k['Bulan'].iloc[-1]} vs {aktif_k['Bulan'].iloc[-2]})",
+                  arah.capitalize(), f"{selisih:+,.0f} USD", delta_color="inverse")
+    else:
+        m4.metric("Tren", "-", help="Butuh minimal 2 bulan yang ada pengeluaran")
+
+    if len(aktif_k):
+        k1, k2 = st.columns(2)
+        with k1:
+            bar = alt.Chart(bln).mark_bar(color=BIRU, cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("Pengeluaran:Q", title="USD"),
+                tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Pengeluaran:Q", format=",.0f")])
+            nama_rata, nama_jatah = "Rata-rata per bulan", "Jatah per bulan (budget ÷ 12)"
+            garis_df = pd.DataFrame({"Garis": [nama_rata, nama_jatah], "Nilai": [rata, jatah]})
+            garis_df = garis_df[garis_df["Nilai"] > 0]
+            garis = alt.Chart(garis_df).mark_rule(strokeWidth=2).encode(
+                y="Nilai:Q",
+                color=alt.Color("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah], range=[KUNING, HIJAU]),
+                                legend=alt.Legend(title=None)),
+                strokeDash=alt.StrokeDash("Garis:N", scale=alt.Scale(domain=[nama_rata, nama_jatah],
+                                                                     range=[[1, 0], [6, 4]]), legend=None))
+            st.altair_chart(gaya(bar + garis, f"{nama}: pengeluaran per bulan", 300), width="stretch")
+        with k2:
+            bln["Kumulatif"] = bln["Pengeluaran"].cumsum()
+            sampai = bln[bln["Pengeluaran"] > 0].index.max()
+            kum_df = bln.loc[:sampai]
+            batas = max(r["Budget"], kum_df["Kumulatif"].max()) * 1.05
+            garis_kum = alt.Chart(kum_df).mark_line(color=KUNING, point=alt.OverlayMarkDef(color=KUNING, size=70)).encode(
+                x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("Kumulatif:Q", title="USD", scale=alt.Scale(domain=[0, batas])),
+                tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Kumulatif:Q", format=",.0f", title="Total terpakai")])
+            lapis = garis_kum
+            if r["Budget"] > 0:
+                batas_budget = alt.Chart(pd.DataFrame({"y": [r["Budget"]]})).mark_rule(
+                    color=MERAH, strokeDash=[6, 4], strokeWidth=2).encode(y="y:Q")
+                lapis = garis_kum + batas_budget
+            st.altair_chart(gaya(lapis, f"{nama}: progres pengeluaran (garis merah = budget {basis})", 300),
+                            width="stretch")
+    else:
+        st.info("Grafik bulanan akan muncul setelah pembayaran punya bulan atau tanggal proses (mis. tanggal PR Submit).")
+
+    # --- rincian pembayaran (kartu siap presentasi)
+    st.markdown("#### Rincian setiap pembayaran")
+    banyak_sub = t["Kategori"].nunique() > 1
+
+    def kartu_bayar(b):
+        bagian = []
+        if banyak_sub and b["Kategori"]:
+            bagian.append(b["Kategori"])
+        if b["Item"]:
+            bagian.append(b["Item"])
+        if b["Bulan"] and b["Bulan"] != "-":
+            bagian.append(b["Bulan"])
+        judul = " • ".join(bagian) if bagian else "Pembayaran"
+        no = f"#{b['No']} " if b["No"] else ""
+        dok = f"No. Dokumen: <b>{html.escape(b['No. Dokumen'])}</b>" if b["No. Dokumen"] else "No. Dokumen: belum diisi"
+        kurs_txt = f" @ {b['Kurs']:,.0f}".replace(",", ".") if b["Kurs"] > 0 else " (kurs belum diisi)"
+        chips = ""
+        for nama_tahap in TAHAP:
+            isi = b[nama_tahap]
+            if isi:
+                chips += f'<div class="chip on">{nama_tahap}<small>{html.escape(isi)}</small></div>'
+            else:
+                chips += f'<div class="chip off">{nama_tahap}<small>-</small></div>'
+        status = b["Status Terakhir"]
+        badge = "✅ Paid" if status == "Paid" else status
+        return (f'<div class="pay-card"><div class="pay-head"><span class="pay-title">{no}{html.escape(judul)}</span>'
+                f'<span class="pay-badge">{html.escape(badge)}</span></div>'
+                f'<div class="pay-doc">{dok}</div>'
+                f'<div class="pay-amt">{idr(b["IDR"])}{kurs_txt} = <b>USD {b["USD"]:,.2f}</b></div>'
+                f'<div class="chips">{chips}</div></div>')
+
+    kolom_bayar = st.columns(2)
+    for i, (_, b) in enumerate(t.iterrows()):
+        with kolom_bayar[i % 2]:
+            st.markdown(kartu_bayar(b), unsafe_allow_html=True)
+    st.caption(f"Total: {idr(t['IDR'].sum())}  •  {usd(t['USD'].sum())}  •  {len(t)} pembayaran")
+    if t["Kurs kosong"].any():
+        st.warning(f"{int(t['Kurs kosong'].sum())} pembayaran punya nominal IDR tetapi Kurs masih kosong, "
+                   "sehingga nilai USD-nya dihitung 0.")
+
+    with st.expander("Lihat sebagai tabel"):
         tampil = t.copy()
         tampil["IDR"] = tampil["IDR"].apply(idr)
         tampil["Kurs"] = tampil["Kurs"].apply(lambda x: f"{x:,.0f}".replace(",", ".") if x > 0 else "-")
         tampil["USD"] = tampil["USD"].apply(lambda x: f"{x:,.2f}")
         kolom_tampil = ["No", "Kategori", "Bulan", "Item", "No. Dokumen", "IDR", "Kurs", "USD"] + TAHAP + ["Status Terakhir"]
-        if tampil["Kategori"].nunique() <= 1:
+        if not banyak_sub:
             kolom_tampil.remove("Kategori")
         if (tampil["Item"] == "").all():
             kolom_tampil.remove("Item")
         st.dataframe(tampil[kolom_tampil], hide_index=True, width="stretch")
-        st.caption(f"Total: {idr(t['IDR'].sum())}  •  {usd(t['USD'].sum())}  •  {len(t)} pembayaran")
-        if t["Kurs kosong"].any():
-            st.warning(f"{int(t['Kurs kosong'].sum())} pembayaran punya nominal IDR tetapi Kurs masih kosong, "
-                       "sehingga nilai USD-nya dihitung 0.")
 
 # =====================================================================
 #  CEK KONSISTENSI
@@ -569,8 +611,3 @@ with st.expander("🔎 Cek konsistensi dengan sheet Summary RKA"):
     cek["Catatan"] = cek.apply(catatan, axis=1)
     cek = cek.rename(columns={"Realisasi Excel": "Realisasi di Summary (USD)", "Realisasi": "Realisasi di Dashboard (USD)"})
     st.dataframe(cek, hide_index=True, width="stretch")
-
-if not sim.empty:
-    st.subheader("Daftar simulasi pembayaran")
-    st.dataframe(sim, hide_index=True, width="stretch")
-    st.download_button("Unduh daftar simulasi (CSV)", sim.to_csv(index=False), "simulasi.csv", "text/csv")

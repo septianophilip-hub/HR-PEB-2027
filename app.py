@@ -5,6 +5,7 @@ import re
 from datetime import date
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 import altair as alt
 
 st.set_page_config(page_title="HR RKA 2027", page_icon="💰", layout="wide")
@@ -22,7 +23,7 @@ ABAIKAN = {"idr", "usd", "description", "total", "no.", "no", "month", "desc", "
 BULAN_PANJANG = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus",
                  "September", "Oktober", "November", "Desember"]
 # Ambang untuk pengingat (bisa diubah sesuai kebutuhan)
-VERSI_PARSER = 4            # naikkan angka ini kalau cara baca Excel berubah (membuang data lama di memori)
+VERSI_PARSER = 5            # naikkan angka ini kalau cara baca Excel berubah (membuang data lama di memori)
 
 AMBANG_LEBIH_CEPAT = 1.15    # terpakai > 115% dari jatah ideal sampai bulan acuan
 AMBANG_SANGAT_CEPAT = 1.5    # terpakai > 150% dari jatah ideal
@@ -182,7 +183,25 @@ def petakan_expense(judul, sheet, daftar):
     return None
 
 
-def baca_detail(xls, daftar_expense):
+def ambil_link(wb, sheet, baris_idx, kolom_idx):
+    """Ambil link dari sel nomor dokumen (hyperlink biasa atau rumus HYPERLINK)."""
+    if wb is None or sheet not in wb.sheetnames:
+        return ""
+    try:
+        sel = wb[sheet].cell(row=baris_idx + 1, column=kolom_idx + 1)
+        url = ""
+        if sel.hyperlink is not None:
+            url = sel.hyperlink.target or ""
+        if not url and isinstance(sel.value, str) and sel.value.strip().upper().startswith("=HYPERLINK"):
+            m = re.search(r'HYPERLINK\(\s*"([^"]+)"', sel.value, re.I)
+            if m:
+                url = m.group(1)
+        return url.strip()
+    except Exception:
+        return ""
+
+
+def baca_detail(xls, daftar_expense, wb=None):
     """Cari semua tabel pembayaran (yang punya kolom 'Docs No.') di semua sheet detail."""
     hasil, tak_terpetakan = [], set()
     for sheet in xls.sheet_names:
@@ -239,6 +258,8 @@ def baca_detail(xls, daftar_expense):
                     if not kosong(no_val):
                         no_aktif = teks_dok(no_val)
                     docs = g.iat[rr, c]
+                    link_asli = ambil_link(wb, sheet, rr, c)
+                    link_web = link_asli if link_asli.lower().startswith(("http://", "https://")) else ""
                     nominal = angka(g.iat[rr, c + 1]) if c + 1 < n_c else 0.0
                     kurs = angka(g.iat[rr, c + 2]) if c + 2 < n_c else 0.0
                     tahap = [g.iat[rr, c + 4 + i] if c + 4 + i < n_c else None for i in range(5)]
@@ -275,7 +296,8 @@ def baca_detail(xls, daftar_expense):
                              "Item": item, "No. Dokumen": teks_dok(docs), "IDR": nominal, "Kurs": kurs,
                              "USD": nilai_usd, "Periode": periode, "Status Terakhir": terakhir,
                              "Tanggal Terakhir": (max(valid) if valid else pd.NaT),
-                             "Kurs kosong": nominal > 0 and kurs <= 0}
+                             "Kurs kosong": nominal > 0 and kurs <= 0,
+                             "Link Dokumen": link_web, "Link Lokal": bool(link_asli) and not link_web}
                     for i, nama in enumerate(TAHAP):
                         baris[nama] = teks[i]
                     hasil.append(baris)
@@ -321,7 +343,11 @@ def proses_excel(isi, nama, versi=0):
         if data is None or data.empty:
             return {"error": "Tabel di sheet 'Summary RKA' tidak ditemukan.", "tebakan": tebakan}
         try:
-            trx, tak = baca_detail(xls, data["Expenses"].tolist())
+            try:
+                wb = load_workbook(io.BytesIO(isi))
+            except Exception:
+                wb = None
+            trx, tak = baca_detail(xls, data["Expenses"].tolist(), wb)
             peringatan = ""
         except Exception as e:
             trx, tak = pd.DataFrame(), []
@@ -512,6 +538,45 @@ def tampilkan_analisis(pesan, ket_ref):
             st.info(teks)
 
 
+def kartu_bayar(b, tampil_sub=False, awalan=""):
+    bagian = []
+    if awalan:
+        bagian.append(awalan)
+    if tampil_sub and b["Kategori"] and b["Kategori"] != awalan:
+        bagian.append(b["Kategori"])
+    if b["Item"]:
+        bagian.append(b["Item"])
+    if b["Bulan"] and b["Bulan"] != "-":
+        bagian.append(b["Bulan"])
+    judul = " • ".join(bagian) if bagian else "Pembayaran"
+    no = f"#{b['No']} " if b["No"] else ""
+    dok = f"No. Dokumen: <b>{html.escape(b['No. Dokumen'])}</b>" if b["No. Dokumen"] else "No. Dokumen: belum diisi"
+    kurs_txt = f" @ {b['Kurs']:,.0f}".replace(",", ".") if b["Kurs"] > 0 else " (kurs belum diisi)"
+    chips = ""
+    for nama_tahap in TAHAP:
+        isi = b[nama_tahap]
+        if isi:
+            chips += f'<div class="chip on">{nama_tahap}<small>{html.escape(isi)}</small></div>'
+        else:
+            chips += f'<div class="chip off">{nama_tahap}<small>-</small></div>'
+    status = b["Status Terakhir"]
+    badge = "✅ Paid" if status == "Paid" else status
+    return (f'<div class="pay-card"><div class="pay-head"><span class="pay-title">{no}{html.escape(judul)}</span>'
+            f'<span class="pay-badge">{html.escape(badge)}</span></div>'
+            f'<div class="pay-doc">{dok}</div>'
+            f'<div class="pay-amt">{idr(b["IDR"])}{kurs_txt} = <b>USD {b["USD"]:,.2f}</b></div>'
+            f'<div class="chips">{chips}</div></div>')
+
+
+def tampilkan_kartu_bayar(b, kunci, tampil_sub=False, awalan=""):
+    st.markdown(kartu_bayar(b, tampil_sub, awalan), unsafe_allow_html=True)
+    if b.get("Link Dokumen"):
+        st.link_button("📄 Buka dokumen", b["Link Dokumen"], key=f"lnk_{kunci}")
+    elif b.get("Link Lokal"):
+        st.caption("📁 Dokumen ini tertaut ke file di laptop, jadi tidak bisa dibuka dari dashboard. "
+                   "Simpan di SharePoint, OneDrive, atau Google Drive lalu tautkan lagi di Excel.")
+
+
 # =====================================================================
 #  UPLOAD
 # =====================================================================
@@ -630,6 +695,30 @@ c2.metric("Terpakai", usd(total_pakai))
 c3.metric("Sisa", usd(total_sisa))
 c4.metric("Utilisasi", f"{persen_total:.1%}")
 st.progress(min(max(persen_total, 0.0), 1.0))
+
+st.markdown("#### 🔎 Cari dokumen atau pembayaran")
+kata = st.text_input("Cari", key=f"cari_{PERUSAHAAN}", label_visibility="collapsed",
+                     placeholder="Ketik No. Dokumen, nama item (mis. Pelatihan 1), kategori, bulan, atau status")
+if kata.strip():
+    if trx.empty:
+        st.info("Belum ada data pembayaran yang terbaca dari Excel.")
+    else:
+        kolom_cari = ["Expense", "Kategori", "Item", "No. Dokumen", "Bulan", "Status Terakhir", "No"]
+        teks_baris = trx[kolom_cari].astype(str).agg(" ".join, axis=1).str.lower()
+        cocok = pd.Series(True, index=trx.index)
+        for kata_kunci in kata.lower().split():
+            cocok &= teks_baris.str.contains(kata_kunci, regex=False)
+        hasil_cari = trx[cocok]
+        if hasil_cari.empty:
+            st.info("Tidak ditemukan. Coba kata kunci lain, misalnya sebagian dari nomor dokumen.")
+        else:
+            batas_tampil = 12
+            st.caption(f"Ditemukan {len(hasil_cari)} pembayaran"
+                       + (f", ditampilkan {batas_tampil} pertama. Perjelas kata kuncinya untuk mempersempit." if len(hasil_cari) > batas_tampil else "."))
+            kolom_cari_ui = st.columns(2)
+            for i, (_, b) in enumerate(hasil_cari.head(batas_tampil).iterrows()):
+                with kolom_cari_ui[i % 2]:
+                    tampilkan_kartu_bayar(b, f"{PERUSAHAAN}_cari_{i}", True, awalan=str(b["Expense"]))
 
 st.divider()
 
@@ -864,37 +953,10 @@ else:
     st.markdown("#### Rincian setiap pembayaran")
     banyak_sub = t["Kategori"].nunique() > 1
 
-    def kartu_bayar(b):
-        bagian = []
-        if banyak_sub and b["Kategori"]:
-            bagian.append(b["Kategori"])
-        if b["Item"]:
-            bagian.append(b["Item"])
-        if b["Bulan"] and b["Bulan"] != "-":
-            bagian.append(b["Bulan"])
-        judul = " • ".join(bagian) if bagian else "Pembayaran"
-        no = f"#{b['No']} " if b["No"] else ""
-        dok = f"No. Dokumen: <b>{html.escape(b['No. Dokumen'])}</b>" if b["No. Dokumen"] else "No. Dokumen: belum diisi"
-        kurs_txt = f" @ {b['Kurs']:,.0f}".replace(",", ".") if b["Kurs"] > 0 else " (kurs belum diisi)"
-        chips = ""
-        for nama_tahap in TAHAP:
-            isi = b[nama_tahap]
-            if isi:
-                chips += f'<div class="chip on">{nama_tahap}<small>{html.escape(isi)}</small></div>'
-            else:
-                chips += f'<div class="chip off">{nama_tahap}<small>-</small></div>'
-        status = b["Status Terakhir"]
-        badge = "✅ Paid" if status == "Paid" else status
-        return (f'<div class="pay-card"><div class="pay-head"><span class="pay-title">{no}{html.escape(judul)}</span>'
-                f'<span class="pay-badge">{html.escape(badge)}</span></div>'
-                f'<div class="pay-doc">{dok}</div>'
-                f'<div class="pay-amt">{idr(b["IDR"])}{kurs_txt} = <b>USD {b["USD"]:,.2f}</b></div>'
-                f'<div class="chips">{chips}</div></div>')
-
     kolom_bayar = st.columns(2)
     for i, (_, b) in enumerate(t.iterrows()):
         with kolom_bayar[i % 2]:
-            st.markdown(kartu_bayar(b), unsafe_allow_html=True)
+            tampilkan_kartu_bayar(b, f"{PERUSAHAAN}_kat_{nama}_{i}", banyak_sub)
     st.caption(f"Total: {idr(t['IDR'].sum())}  •  {usd(t['USD'].sum())}  •  {len(t)} pembayaran")
     if t["Kurs kosong"].any():
         st.warning(f"{int(t['Kurs kosong'].sum())} pembayaran punya nominal IDR tetapi Kurs masih kosong, "
@@ -910,7 +972,11 @@ else:
             kolom_tampil.remove("Kategori")
         if (tampil["Item"] == "").all():
             kolom_tampil.remove("Item")
-        st.dataframe(tampil[kolom_tampil], hide_index=True, width="stretch")
+        konfigurasi = {}
+        if "Link Dokumen" in tampil.columns and tampil["Link Dokumen"].astype(bool).any():
+            kolom_tampil.append("Link Dokumen")
+            konfigurasi["Link Dokumen"] = st.column_config.LinkColumn("Dokumen", display_text="Buka")
+        st.dataframe(tampil[kolom_tampil], hide_index=True, width="stretch", column_config=konfigurasi)
 
 # =====================================================================
 #  CEK KONSISTENSI

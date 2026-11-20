@@ -2,7 +2,7 @@ import html
 import io
 import os
 import re
-from datetime import date
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
@@ -23,7 +23,7 @@ ABAIKAN = {"idr", "usd", "description", "total", "no.", "no", "month", "desc", "
 BULAN_PANJANG = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus",
                  "September", "Oktober", "November", "Desember"]
 # Ambang untuk pengingat (bisa diubah sesuai kebutuhan)
-VERSI_PARSER = 5            # naikkan angka ini kalau cara baca Excel berubah (membuang data lama di memori)
+VERSI_PARSER = 6            # naikkan angka ini kalau cara baca Excel berubah (membuang data lama di memori)
 
 AMBANG_LEBIH_CEPAT = 1.15    # terpakai > 115% dari jatah ideal sampai bulan acuan
 AMBANG_SANGAT_CEPAT = 1.5    # terpakai > 150% dari jatah ideal
@@ -67,6 +67,14 @@ st.markdown(f"""<style>
 .chip.on small{{color:#ffffff}}
 .chip.off{{background:#16233a;border:1px solid #223756;color:#6f86a6}}
 </style>""", unsafe_allow_html=True)
+
+
+def tanggal_hari_ini_wib():
+    """Tanggal hari ini menurut WIB (server Streamlit memakai UTC, jadi dikonversi supaya tidak selisih sehari)."""
+    return datetime.now(timezone(timedelta(hours=7))).date()
+
+
+NAMA_HARI = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
 
 
 def usd(x):
@@ -342,9 +350,11 @@ def proses_excel(isi, nama, versi=0):
         data = baca_summary(xls)
         if data is None or data.empty:
             return {"error": "Tabel di sheet 'Summary RKA' tidak ditemukan.", "tebakan": tebakan}
+        wb, diubah = None, None
         try:
             try:
                 wb = load_workbook(io.BytesIO(isi))
+                diubah = getattr(wb.properties, "modified", None)
             except Exception:
                 wb = None
             trx, tak = baca_detail(xls, data["Expenses"].tolist(), wb)
@@ -352,7 +362,8 @@ def proses_excel(isi, nama, versi=0):
         except Exception as e:
             trx, tak = pd.DataFrame(), []
             peringatan = f"Detail pembayaran belum bisa dibaca ({e}). Dashboard memakai angka dari sheet Summary RKA."
-        return {"error": "", "data": data, "trx": trx, "tak": tak, "peringatan": peringatan, "tebakan": tebakan}
+        return {"error": "", "data": data, "trx": trx, "tak": tak, "peringatan": peringatan, "tebakan": tebakan,
+                "diubah": diubah}
     except Exception as e:
         return {"error": f"Gagal membaca file. Pastikan ada sheet bernama 'Summary RKA'. Detail: {e}",
                 "tebakan": deteksi_perusahaan(nama, xls)}
@@ -579,7 +590,7 @@ def analisis_kategori(budget, terpakai, t, per_bulan, tahun, basis, hari_ini, m_
     return pesan, ket_ref, nama_ref
 
 
-def tampilkan_analisis(pesan, ket_ref):
+def tampilkan_analisis(pesan, ket_ref, tanggal=None):
     urut = {"merah": 0, "kuning": 1, "info": 2, "hijau": 3}
     pesan = sorted(pesan, key=lambda p: urut[p[0]])
     levels = [p[0] for p in pesan]
@@ -593,8 +604,11 @@ def tampilkan_analisis(pesan, ket_ref):
         status = "ℹ️ Informasi"
     st.markdown("#### 🧠 Analisis & Saran")
     st.markdown(f"**Status: {status}**")
+    bagian_tgl = f"Per {tanggal:%d/%m/%Y}. " if tanggal else ""
     if ket_ref:
-        st.caption(f"Acuan waktu: {ket_ref}. Dihitung dari angka di Excel (jatah ideal per bulan = budget ÷ 12).")
+        st.caption(f"{bagian_tgl}Acuan waktu: {ket_ref}. Dihitung dari angka di Excel (jatah ideal per bulan = budget ÷ 12).")
+    elif bagian_tgl:
+        st.caption(bagian_tgl.strip())
     for level, judul, isi, saran in pesan:
         teks = f"**{judul}**  \n{isi}" + (f"\n\n💡 **Saran:** {saran}" if saran else "")
         if level == "merah":
@@ -725,7 +739,26 @@ if tak_terpetakan:
 # =====================================================================
 #  PERHITUNGAN
 # =====================================================================
-basis = st.radio("Basis budget", ["SKK", "Internal"], horizontal=True)
+kol_basis, kol_tgl = st.columns([3, 2])
+with kol_basis:
+    basis = st.radio("Basis budget", ["SKK", "Internal"], horizontal=True)
+HARI_INI_WIB = tanggal_hari_ini_wib()
+with kol_tgl:
+    HARI_INI = st.date_input("📅 Tanggal update (analisis dihitung per tanggal ini)", value=HARI_INI_WIB,
+                             format="DD/MM/YYYY")
+if not hasattr(HARI_INI, "year"):
+    HARI_INI = HARI_INI_WIB
+teks_tanggal = f"{NAMA_HARI[HARI_INI.weekday()]}, {HARI_INI.day} {BULAN_PANJANG[HARI_INI.month - 1]} {HARI_INI.year}"
+st.caption(f"Analisis dihitung per **{teks_tanggal}**"
+           + (" (hari ini, WIB)." if HARI_INI == HARI_INI_WIB else " (tanggal yang Anda pilih, bukan hari ini)."))
+diubah_file = h.get("diubah")
+if diubah_file:
+    tgl_file = diubah_file + timedelta(hours=7)
+    st.caption(f"📄 File Excel {PERUSAHAAN} terakhir disimpan: {tgl_file:%d/%m/%Y %H:%M} WIB.")
+    selisih_hari = (HARI_INI - tgl_file.date()).days
+    if selisih_hari > 14:
+        st.warning(f"File Excel ini terakhir disimpan {selisih_hari} hari sebelum tanggal analisis. "
+                   "Pastikan datanya sudah diperbarui supaya analisis tidak menyesatkan.")
 kolom_budget = "Budget SKK (USD)" if basis == "SKK" else "Budget Internal (USD)"
 data["Budget"] = data[kolom_budget]
 
@@ -905,11 +938,12 @@ if not trx.empty:
 st.divider()
 st.header("🔮 Prediksi Akhir Tahun")
 st.markdown("**Kalau pengeluaran berjalan seperti sekarang, bagaimana kondisi keuangan di akhir tahun?**")
-hari_ini = date.today()
+hari_ini = HARI_INI
 pilih_acuan = st.selectbox("Data Excel ini realisasi sampai bulan", ["Otomatis (bulan berjalan)"] + BULAN_PANJANG,
                            key=f"acuan_{PERUSAHAAN}",
                            help="Bulan setelah ini dianggap belum terjadi. Pembayaran yang sudah terisi di bulan itu "
                                 "dianggap rencana pasti, bulan yang masih kosong diisi rata-rata.")
+st.caption(f"Pilihan Otomatis mengikuti tanggal update ({HARI_INI:%d/%m/%Y}).")
 if pilih_acuan.startswith("Otomatis"):
     if hari_ini.year == tahun:
         M_ACUAN, KET_ACUAN = hari_ini.month, "bulan berjalan"
@@ -1143,8 +1177,8 @@ else:
 
     # --- analisis & saran
     pesan, ket_ref, _ = analisis_kategori(r["Budget"], r["Total Terpakai"], t, bln["Pengeluaran"].tolist(),
-                                          tahun, basis, date.today(), M_ACUAN, KET_ACUAN)
-    tampilkan_analisis(pesan, ket_ref)
+                                          tahun, basis, HARI_INI, M_ACUAN, KET_ACUAN)
+    tampilkan_analisis(pesan, ket_ref, HARI_INI)
 
     # --- rincian pembayaran (kartu siap presentasi)
     st.markdown("#### Rincian setiap pembayaran")

@@ -358,7 +358,79 @@ def proses_excel(isi, nama, versi=0):
                 "tebakan": deteksi_perusahaan(nama, xls)}
 
 
-def analisis_kategori(budget, terpakai, t, per_bulan, tahun, basis, hari_ini):
+def usd_s(x):
+    return ("-" if x < 0 else "") + f"USD {abs(x):,.0f}"
+
+
+def hitung_forecast(budget, per_bulan, usd_tak, m_ref):
+    """Prediksi akhir tahun jika pengeluaran berjalan seperti sekarang.
+    - rata-rata A = total terpakai sampai bulan acuan / jumlah bulan (bulan tanpa pembayaran ikut dihitung)
+    - rata-rata B = rata-rata 3 bulan terakhir (hanya untuk data yang punya tanggal)
+    - bulan setelah acuan yang sudah terisi di Excel dianggap sudah pasti, bulan yang masih kosong diisi rata-rata."""
+    ytd_bertanggal = sum(per_bulan[:m_ref])
+    terpakai_ytd = ytd_bertanggal + usd_tak
+    terisi_depan = sum(per_bulan[m_ref:])
+    total_terisi = terpakai_ytd + terisi_depan
+    rata_a = terpakai_ytd / m_ref
+    jendela = per_bulan[max(0, m_ref - 3):m_ref]
+    rata_b = (sum(jendela) / len(jendela)) if (ytd_bertanggal > 0 and jendela) else rata_a
+    kosong_depan = sum(1 for v in per_bulan[m_ref:] if v == 0)
+    return {"terpakai_ytd": terpakai_ytd, "terisi_depan": terisi_depan, "total_terisi": total_terisi,
+            "rata_a": rata_a, "rata_b": rata_b, "kosong_depan": kosong_depan,
+            "pred_a": total_terisi + rata_a * kosong_depan, "pred_b": total_terisi + rata_b * kosong_depan}
+
+
+def status_forecast(budget, pred):
+    if budget <= 0:
+        return "⚪ Budget belum diisi"
+    rasio = pred / budget
+    if rasio > 1.02:
+        return "🔴 Melebihi budget"
+    if rasio > 0.95:
+        return "🟠 Mepet"
+    if rasio < 0.7:
+        return "🟡 Serapan rendah"
+    return "🟢 Aman"
+
+
+def susun_bulanan(per_bulan, usd_tak, rata_a, m_ref):
+    real, tak, terisi, pred = [0.0] * 12, [0.0] * 12, [0.0] * 12, [0.0] * 12
+    for i in range(12):
+        if i < m_ref:
+            real[i] = per_bulan[i]
+            tak[i] = usd_tak / m_ref
+        elif per_bulan[i] > 0:
+            terisi[i] = per_bulan[i]
+        else:
+            pred[i] = rata_a
+    return real, tak, terisi, pred
+
+
+def chart_prediksi(real, tak, terisi, pred, jatah, judul, tinggi=340):
+    jenis = [("Realisasi", real), ("Belum bertanggal (dibagi rata)", tak),
+             ("Sudah terisi di Excel", terisi), ("Prediksi", pred)]
+    baris = [{"Bulan": BULAN_PENDEK[i], "Jenis": nama, "USD": v, "Urut": k}
+             for k, (nama, nilai) in enumerate(jenis) for i, v in enumerate(nilai) if v > 0]
+    if not baris:
+        return None
+    total_bln = [real[i] + tak[i] + terisi[i] + pred[i] for i in range(12)]
+    puncak = max(max(total_bln), jatah) * 1.15
+    bar = alt.Chart(pd.DataFrame(baris)).mark_bar().encode(
+        x=alt.X("Bulan:N", sort=BULAN_PENDEK, title=None, axis=alt.Axis(labelAngle=0),
+                scale=alt.Scale(domain=BULAN_PENDEK)),
+        y=alt.Y("USD:Q", title="USD per bulan", stack="zero", scale=alt.Scale(domain=[0, puncak])),
+        color=alt.Color("Jenis:N", scale=alt.Scale(domain=[n for n, _ in jenis], range=[BIRU, "#6c8ebf", "#2bb8a7", KUNING]),
+                        legend=alt.Legend(title=None, columns=2)),
+        order=alt.Order("Urut:Q"),
+        tooltip=[alt.Tooltip("Bulan:N"), alt.Tooltip("Jenis:N"), alt.Tooltip("USD:Q", format=",.0f")])
+    lapis = bar
+    if jatah > 0:
+        lapis = lapis + alt.Chart(pd.DataFrame({"y": [jatah]})).mark_rule(
+            color=HIJAU, strokeWidth=2, strokeDash=[6, 4]).encode(y="y:Q")
+    return gaya(lapis, judul, tinggi)
+
+
+def analisis_kategori(budget, terpakai, t, per_bulan, tahun, basis, hari_ini, m_acuan=None, ket_acuan=""):
     """Pengingat dan saran berbasis aturan hitungan (bukan AI generatif).
     Membandingkan pemakaian dengan jatah ideal per bulan (budget / 12)."""
     pesan = []
@@ -375,7 +447,9 @@ def analisis_kategori(budget, terpakai, t, per_bulan, tahun, basis, hari_ini):
     usd_tak = float(tak_bertanggal["USD"].sum())
     aktif_idx = [i for i, v in enumerate(per_bulan) if v > 0]
 
-    if hari_ini.year == tahun:
+    if m_acuan:
+        m_ref, ket_ref = m_acuan, ket_acuan or "bulan acuan"
+    elif hari_ini.year == tahun:
         m_ref, ket_ref = hari_ini.month, "bulan berjalan"
     elif hari_ini.year > tahun:
         m_ref, ket_ref = 12, "akhir tahun anggaran"
@@ -464,20 +538,15 @@ def analisis_kategori(budget, terpakai, t, per_bulan, tahun, basis, hari_ini):
             tambah("kuning", "Ada bulan yang belum terealisasi",
                    "Pola pengeluaran kategori ini rutin tiap bulan, tetapi belum ada pembayaran di: " + ", ".join(kosong) + ".",
                    "Pastikan tagihan bulan tersebut sudah diproses. Kalau terlewat, segera ajukan supaya tidak menumpuk di bulan berikutnya.")
-        rata_ref = sum(aktif_ref) / len(aktif_ref)
-        bulan_kosong_depan = sum(1 for v in per_bulan[m_ref:] if v == 0)
-        proyeksi = terpakai + rata_ref * bulan_kosong_depan
-        if bulan_kosong_depan:
-            if proyeksi > budget * 1.02:
-                tambah("kuning", "Proyeksi akhir tahun melewati budget",
-                       f"Dengan rata-rata {usd(rata_ref)} per bulan, total akhir tahun diperkirakan sekitar {usd(proyeksi)}, "
-                       f"melebihi budget {usd(budget)} sebesar {usd(proyeksi - budget)}.",
-                       "Cari penghematan sejak sekarang atau siapkan usulan tambahan budget lebih awal.")
-            elif proyeksi < budget * 0.85:
-                tambah("info", "Proyeksi akhir tahun di bawah budget",
-                       f"Dengan rata-rata {usd(rata_ref)} per bulan, total akhir tahun sekitar {usd(proyeksi)}, "
-                       f"sisa sekitar {usd(budget - proyeksi)} dari budget {usd(budget)}.",
-                       "Kalau sisa ini tidak akan terpakai, pertimbangkan realokasi ke pos yang kekurangan.")
+
+    # 4b. prediksi akhir tahun kalau berjalan seperti sekarang
+    if m_ref and bulan_sisa:
+        fc = hitung_forecast(budget, per_bulan, usd_tak, m_ref)
+        if fc["pred_a"] > budget * 1.02:
+            tambah("merah" if fc["pred_a"] > budget * 1.15 else "kuning", "Prediksi akhir tahun melewati budget",
+                   f"Jika berjalan seperti sekarang (rata-rata {usd(fc['rata_a'])} per bulan), total akhir tahun sekitar "
+                   f"{usd(fc['pred_a'])}, melebihi budget {usd(budget)} sebesar {usd(fc['pred_a'] - budget)}.",
+                   "Cari penghematan sejak sekarang, tunda pembayaran yang tidak mendesak, atau siapkan usulan tambahan budget lebih awal.")
 
     # 5. ruang budget ke depan
     if m_ref and bulan_sisa and budget > terpakai:
@@ -834,6 +903,107 @@ if not trx.empty:
                    "(isi tanggal PR Submit di Excel).")
 
 st.divider()
+st.header("🔮 Prediksi Akhir Tahun")
+st.markdown("**Kalau pengeluaran berjalan seperti sekarang, bagaimana kondisi keuangan di akhir tahun?**")
+hari_ini = date.today()
+pilih_acuan = st.selectbox("Data Excel ini realisasi sampai bulan", ["Otomatis (bulan berjalan)"] + BULAN_PANJANG,
+                           key=f"acuan_{PERUSAHAAN}",
+                           help="Bulan setelah ini dianggap belum terjadi. Pembayaran yang sudah terisi di bulan itu "
+                                "dianggap rencana pasti, bulan yang masih kosong diisi rata-rata.")
+if pilih_acuan.startswith("Otomatis"):
+    if hari_ini.year == tahun:
+        M_ACUAN, KET_ACUAN = hari_ini.month, "bulan berjalan"
+    elif hari_ini.year > tahun:
+        M_ACUAN, KET_ACUAN = 12, "akhir tahun anggaran"
+    else:
+        M_ACUAN, KET_ACUAN = None, ""
+else:
+    M_ACUAN, KET_ACUAN = BULAN_PANJANG.index(pilih_acuan) + 1, "bulan acuan yang Anda pilih"
+PESAN_ACUAN = (f"Tahun anggaran {tahun} belum berjalan, jadi bulan acuannya belum bisa ditentukan otomatis. "
+               "Pilih bulan di kotak di atas untuk melihat prediksi (misalnya anggap data Excel ini realisasi sampai Maret).")
+
+if M_ACUAN is None:
+    st.info(PESAN_ACUAN)
+elif trx.empty:
+    st.info("Belum ada data pembayaran yang terbaca dari Excel, jadi prediksi belum bisa dihitung.")
+else:
+    nama_acuan = BULAN_PANJANG[M_ACUAN - 1]
+    baris_fc = []
+    ag_real, ag_tak, ag_terisi, ag_pred = [0.0] * 12, [0.0] * 12, [0.0] * 12, [0.0] * 12
+    for _, rk in data.iterrows():
+        t_k = trx[trx["Expense"] == rk["Expenses"]]
+        pb_k = deret_bulanan(t_k)["Pengeluaran"].tolist()
+        ut_k = float(t_k[t_k["Periode"].isna()]["USD"].sum())
+        fc = hitung_forecast(rk["Budget"], pb_k, ut_k, M_ACUAN)
+        for lst, nilai in zip((ag_real, ag_tak, ag_terisi, ag_pred), susun_bulanan(pb_k, ut_k, fc["rata_a"], M_ACUAN)):
+            for i in range(12):
+                lst[i] += nilai[i]
+        baris_fc.append({"nama": rk["Expenses"], "budget": rk["Budget"], **fc})
+    fk = pd.DataFrame(baris_fc)
+    tot_budget = fk["budget"].sum()
+    tot_pred_a, tot_pred_b = fk["pred_a"].sum(), fk["pred_b"].sum()
+    tot_rata = fk["rata_a"].sum()
+    tot_terisi = fk["total_terisi"].sum()
+
+    f1, f2, f3, f4 = st.columns(4)
+    f1.metric("Prediksi total akhir tahun", usd(tot_pred_a))
+    f2.metric(f"Budget {basis}", usd(tot_budget))
+    f3.metric("Sisa / (Defisit) akhir tahun", usd_s(tot_budget - tot_pred_a) if tot_budget > 0 else "-")
+    f4.metric(f"Rata-rata per bulan (sampai {nama_acuan})", usd(tot_rata))
+
+    if tot_budget <= 0:
+        st.warning(f"Budget {basis} masih 0, jadi kondisi akhir tahun belum bisa dinilai.")
+    else:
+        rasio_t = tot_pred_a / tot_budget
+        berisiko = fk[(fk["budget"] > 0) & (fk["pred_a"] > fk["budget"] * 1.02)].copy()
+        berisiko["lebih"] = berisiko["pred_a"] - berisiko["budget"]
+        berisiko = berisiko.sort_values("lebih", ascending=False)
+        daftar = ", ".join(f"{b['nama']} ({usd(b['lebih'])})" for _, b in berisiko.head(4).iterrows())
+        ringkas = (f"Total akhir tahun diperkirakan **{usd(tot_pred_a)}** dari budget {usd(tot_budget)} ({rasio_t:.0%}), "
+                   f"dengan rata-rata {usd(tot_rata)} per bulan.")
+        if tot_pred_a > tot_budget * 1.02:
+            st.error(f"**Diperkirakan defisit {usd(tot_pred_a - tot_budget)} di akhir tahun.** {ringkas}"
+                     + (f"\n\n💡 **Saran:** Kategori yang paling berisiko melebihi budget: {daftar}. Tahan atau jadwalkan ulang "
+                        "pembayaran yang tidak mendesak, dan siapkan usulan tambahan budget atau realokasi lebih awal." if daftar else ""))
+        elif rasio_t > 0.95:
+            st.warning(f"**Budget akan mepet di akhir tahun.** {ringkas}"
+                       + (f"\n\n💡 **Saran:** Pantau terus, terutama {daftar}." if daftar else ""))
+        elif rasio_t < 0.7:
+            st.info(f"**Serapan budget rendah.** {ringkas} Diperkirakan sisa {usd(tot_budget - tot_pred_a)} tidak terpakai."
+                    f"\n\n💡 **Saran:** Cek apakah ada kegiatan atau tagihan yang tertunda, atau pertimbangkan realokasi ke pos yang kekurangan.")
+        else:
+            st.success(f"**Kondisi akhir tahun diperkirakan aman.** {ringkas} Sisa sekitar {usd(tot_budget - tot_pred_a)}."
+                       + (f"\n\n💡 **Catatan:** Tetap pantau {daftar}." if daftar else ""))
+        if abs(tot_pred_b - tot_pred_a) > 0.02 * tot_budget:
+            st.caption(f"Jika mengikuti tren 3 bulan terakhir, prediksi total menjadi {usd(tot_pred_b)} "
+                       f"({'defisit' if tot_pred_b > tot_budget else 'sisa'} {usd(abs(tot_budget - tot_pred_b))}).")
+
+    jatah_t = tot_budget / 12 if tot_budget > 0 else 0.0
+    gambar = chart_prediksi(ag_real, ag_tak, ag_terisi, ag_pred, jatah_t, "Pengeluaran per bulan: realisasi dan prediksi (semua kategori)", 340)
+    if gambar is not None:
+        st.altair_chart(gambar, width="stretch")
+        st.caption("Garis hijau putus-putus = jatah per bulan (budget ÷ 12).")
+
+    st.markdown("##### Prediksi per kategori")
+    tabel_fc = fk.copy()
+    tabel_fc["urut"] = tabel_fc.apply(lambda x: x["pred_a"] / x["budget"] if x["budget"] > 0 else -1, axis=1)
+    tabel_fc = tabel_fc.sort_values("urut", ascending=False)
+    st.dataframe(pd.DataFrame({
+        "Kategori": tabel_fc["nama"],
+        "Budget": tabel_fc["budget"].apply(usd),
+        "Terisi di Excel": tabel_fc["total_terisi"].apply(usd),
+        "Rata-rata per bulan": tabel_fc["rata_a"].apply(usd),
+        "Prediksi akhir tahun": tabel_fc["pred_a"].apply(usd),
+        "Sisa / (Defisit)": tabel_fc.apply(lambda x: usd_s(x["budget"] - x["pred_a"]) if x["budget"] > 0 else "-", axis=1),
+        "Status": tabel_fc.apply(lambda x: status_forecast(x["budget"], x["pred_a"]), axis=1),
+    }), hide_index=True, width="stretch")
+    st.caption(f"Cara hitung: rata-rata per bulan = total terpakai sampai {nama_acuan} dibagi {M_ACUAN} bulan "
+               "(bulan tanpa pembayaran ikut dihitung, jadi cocok juga untuk pengeluaran tidak bulanan seperti Training dan Orsosbud). "
+               "Bulan setelahnya yang masih kosong diisi rata-rata itu, sedangkan yang sudah terisi di Excel dianggap pasti. "
+               "Pembayaran yang belum bertanggal dianggap sudah terjadi sampai bulan acuan. "
+               "Ini perkiraan kasar dengan asumsi pola berlanjut. Pembayaran besar sekali bayar di masa depan tidak ikut terprediksi.")
+
+st.divider()
 
 # =====================================================================
 #  BAGIAN BAWAH: DETAIL PER KATEGORI
@@ -944,9 +1114,36 @@ else:
         st.caption("Garis kuning = rata-rata per pembayaran. Pembayaran ini belum punya bulan atau tanggal proses, "
                    "jadi ditampilkan per pembayaran. Isi tanggal PR Submit di Excel supaya muncul di grafik per bulan.")
 
+    # --- prediksi akhir tahun per kategori
+    st.markdown("#### 🔮 Prediksi akhir tahun")
+    if M_ACUAN is None:
+        st.info(PESAN_ACUAN)
+    else:
+        pb_k = bln["Pengeluaran"].tolist()
+        ut_k = float(t[t["Periode"].isna()]["USD"].sum())
+        fc = hitung_forecast(r["Budget"], pb_k, ut_k, M_ACUAN)
+        n_ytd = int((t["Periode"].isna() | (t["Periode"].dt.month <= M_ACUAN)).sum())
+        rata_bayar = fc["terpakai_ytd"] / n_ytd if n_ytd else 0.0
+        frek = n_ytd / M_ACUAN
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric(f"Rata-rata per bulan (sampai {BULAN_PANJANG[M_ACUAN - 1]})", usd(fc["rata_a"]),
+                  help="Total terpakai dibagi jumlah bulan berjalan. Bulan tanpa pembayaran ikut dihitung.")
+        p2.metric("Prediksi akhir tahun", usd(fc["pred_a"]))
+        p3.metric("Sisa / (Defisit) akhir tahun", usd_s(r["Budget"] - fc["pred_a"]) if r["Budget"] > 0 else "Budget belum diisi")
+        p4.metric("Rata-rata per pembayaran", usd(rata_bayar))
+        st.markdown(f"**{status_forecast(r['Budget'], fc['pred_a'])}**")
+        st.caption(f"Frekuensi {frek:.1f} pembayaran per bulan. Kalau berlanjut, kira-kira {frek * fc['kosong_depan']:.0f} "
+                   "pembayaran lagi sampai akhir tahun.")
+        if r["Budget"] > 0 and abs(fc["pred_b"] - fc["pred_a"]) > 0.02 * r["Budget"]:
+            st.caption(f"Jika mengikuti tren 3 bulan terakhir ({usd(fc['rata_b'])} per bulan), prediksi menjadi {usd(fc['pred_b'])}.")
+        gambar_k = chart_prediksi(*susun_bulanan(pb_k, ut_k, fc["rata_a"], M_ACUAN), jatah,
+                                  f"{nama}: realisasi dan prediksi per bulan", 320)
+        if gambar_k is not None:
+            st.altair_chart(gambar_k, width="stretch")
+
     # --- analisis & saran
     pesan, ket_ref, _ = analisis_kategori(r["Budget"], r["Total Terpakai"], t, bln["Pengeluaran"].tolist(),
-                                          tahun, basis, date.today())
+                                          tahun, basis, date.today(), M_ACUAN, KET_ACUAN)
     tampilkan_analisis(pesan, ket_ref)
 
     # --- rincian pembayaran (kartu siap presentasi)
